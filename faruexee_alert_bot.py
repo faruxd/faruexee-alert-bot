@@ -30,6 +30,8 @@
 import requests
 import json
 import os
+import signal
+import sys
 import time
 from datetime import datetime, timezone
 from keep_alive import keep_alive
@@ -350,6 +352,46 @@ def run_indicator(candles):
         })
 
     return active_zones, tapped_last_bar
+
+
+# =============================================================
+#   🟢🔴  BOT STATUS ALERTS (Online / Offline)
+# =============================================================
+
+def send_status_alert(online: bool):
+    """Send a green Online or red Offline embed to Discord."""
+    if online:
+        embed = {
+            "title":     "🟢  Bot is Online",
+            "description": (
+                f"FARUEXEE Alert Bot has started successfully.\n"
+                f"Scanning **{len(SYMBOLS)} pairs** across **{len(TIMEFRAMES)} timeframes** "
+                f"every **{CHECK_INTERVAL}s**."
+            ),
+            "color":     0x00C853,
+            "footer":    {"text": "FARUEXEE Alert Bot"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        embed = {
+            "title":       "🔴  Bot is Offline",
+            "description": "FARUEXEE Alert Bot has disconnected or crashed. It will restart automatically on Render.",
+            "color":       0xD50000,
+            "footer":      {"text": "FARUEXEE Alert Bot"},
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+    except Exception as e:
+        print(f"  [ERROR] Status alert failed: {e}")
+
+
+def handle_shutdown(signum, frame):
+    """Catch shutdown signals and send Offline alert before exiting."""
+    print("\n  [SHUTDOWN] Signal received — sending offline alert...")
+    send_status_alert(online=False)
+    sys.exit(0)
 
 
 # =============================================================
@@ -676,6 +718,10 @@ if __name__ == "__main__":
 
     keep_alive()
 
+    # ── Register shutdown handler — sends Offline alert on exit ──
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT,  handle_shutdown)
+
     print("\n" + "="*58)
     print("  FARUEXEE ALERT BOT  —  v2")
     print("="*58)
@@ -688,6 +734,9 @@ if __name__ == "__main__":
     print(f"  TP Fallback : {TP_MULTI}x RR")
     print("="*58)
     print("\n  Listening for FARUEXEE zones...\n")
+
+    # ── Send Online alert ──
+    send_status_alert(online=True)
 
     while True:
         try:
