@@ -193,7 +193,8 @@ def run_indicator(candles):
     We strip it so the indicator only runs on confirmed closed candles —
     matching TradingView's default barstate.isconfirmed behaviour.
     """
-    candles = candles[:-1]   # drop live candle — only use closed bars
+    live_candle = candles[-1]  # save live candle for immediate tap detection
+    candles = candles[:-1]     # drop live candle — only use closed bars for zone detection
 
     if len(candles) < LOOKBACK * 2 + 10:
         return [], []   # must match the tuple return at the end
@@ -351,7 +352,36 @@ def run_indicator(candles):
             "tp3":     z["tp3"],
         })
 
-    return active_zones, tapped_last_bar
+    # ── Check live candle for immediate zone taps ──
+    live_high = float(live_candle[2])
+    live_low  = float(live_candle[3])
+
+    live_taps = []
+    for z in demand_zones:
+        if live_low <= z["top"]:
+            live_taps.append({
+                "zone_id": f"demand_{z['ts']}_{round(z['top'], 6)}",
+                "side":    "buy",
+                "entry":   z["entry"],
+                "sl":      z["sl"],
+                "tp1":     z["tp1"],
+                "tp2":     z["tp2"],
+                "tp3":     z["tp3"],
+            })
+
+    for z in supply_zones:
+        if live_high >= z["bot"]:
+            live_taps.append({
+                "zone_id": f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                "side":    "sell",
+                "entry":   z["entry"],
+                "sl":      z["sl"],
+                "tp1":     z["tp1"],
+                "tp2":     z["tp2"],
+                "tp3":     z["tp3"],
+            })
+
+    return active_zones, tapped_last_bar, live_taps
 
 
 # =============================================================
@@ -606,27 +636,31 @@ def run_bot():
             current_price = float(candles[-1][4])
             print(f"  Price: {current_price}")
 
-            active_zones, tapped_zones = run_indicator(candles)
+            active_zones, tapped_zones, live_taps = run_indicator(candles)
             active_zone_ids  = {z["zone_id"] for z in active_zones}
             tapped_zone_ids  = {z["zone_id"]: z for z in tapped_zones}
 
             print(f"  Active zones : {len(active_zones)}")
             if tapped_zones:
                 print(f"  Tapped zones : {len(tapped_zones)}")
+            if live_taps:
+                print(f"  Live taps    : {len(live_taps)}")
             zones_found += len(active_zones)
 
             # ── Handle zones that are no longer active ──
             stale_keys = [
                 k for k, v in state.items()
-                if k.startswith(key_prefix) and v.get("zone_id") not in active_zone_ids
+                if k.startswith(key_prefix)
+                and not k.startswith(f"{key_prefix}_liveTap_")
+                and v.get("zone_id") not in active_zone_ids
             ]
             for k in stale_keys:
                 zone_id   = state[k].get("zone_id")
                 zone_info = tapped_zone_ids.get(zone_id)
 
                 if zone_info:
-                    # Zone was tapped on this bar — send tap alert
-                    print(f"\n  Zone Tapped! Sending alert...")
+                    # Zone was tapped on a closed candle — send tap alert
+                    print(f"\n  Zone Tapped (closed candle)! Sending alert...")
                     success = send_discord_tap_alert(symbol, tf, zone_info)
                     if success:
                         print(f"  Tap alert sent!")
@@ -636,6 +670,28 @@ def run_bot():
                     print(f"  Zone expired — removing from state: {k}")
 
                 del state[k]
+                # also clean up any live tap state for this zone
+                live_tap_key = f"{key_prefix}_liveTap_{zone_id}"
+                if live_tap_key in state:
+                    del state[live_tap_key]
+
+            # ── Immediate tap alerts — live candle touching zone ──
+            for zone in live_taps:
+                live_tap_key = f"{key_prefix}_liveTap_{zone['zone_id']}"
+
+                if live_tap_key in state:
+                    continue   # already alerted for this touch — skip
+
+                print(f"\n  Zone Tapped (live candle)! Sending immediate alert...")
+                success = send_discord_tap_alert(symbol, tf, zone)
+                if success:
+                    print(f"  Immediate tap alert sent!")
+                    state[live_tap_key] = {
+                        "zone_id":    zone["zone_id"],
+                        "alerted_at": datetime.now().isoformat()
+                    }
+                else:
+                    print(f"  [ERROR] Immediate tap alert failed.")
 
             # ── Alert for new zones ──
             for zone in active_zones:
