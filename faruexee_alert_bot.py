@@ -539,7 +539,10 @@ def save_state(state):
 #   🤖  MAIN BOT LOGIC
 # =============================================================
 
+_is_first_run = True   # On startup, silently record all existing zones — no alerts
+
 def run_bot():
+    global _is_first_run
     print(f"\n{'='*58}")
     print(f"  Bot Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*58}")
@@ -600,7 +603,22 @@ def run_bot():
                     print(f"  Already alerted: {zone['zone_id'][:40]}...")
                     continue
 
-                # New zone — send alert
+                # First run after startup — record existing zones silently, no alert
+                if _is_first_run:
+                    print(f"  [Startup] Recording existing zone (no alert): {zone['zone_id'][:40]}...")
+                    state[state_key] = {
+                        "zone_id":    zone["zone_id"],
+                        "symbol":     symbol,
+                        "timeframe":  tf,
+                        "side":       zone["side"],
+                        "entry":      zone["entry"],
+                        "sl":         zone["sl"],
+                        "tp1":        zone["tp1"],
+                        "alerted_at": datetime.now().isoformat()
+                    }
+                    continue
+
+                # New zone appeared after startup — send alert
                 side  = zone["side"]
                 entry = zone["entry"]
                 sl    = zone["sl"]
@@ -634,6 +652,11 @@ def run_bot():
 
         # Save after every symbol — so a crash mid-run doesn't lose sent alerts
         save_state(state)
+
+    if _is_first_run:
+        print(f"\n  [Startup] First scan complete — existing zones recorded, no alerts sent.")
+        print(f"  [Startup] Bot will now alert only NEW zones going forward.")
+        _is_first_run = False
 
     print(f"\n  Alerts sent this run : {alerts_sent}")
     print(f"  Total zones tracked  : {len(state)}")
