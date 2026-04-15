@@ -242,13 +242,15 @@ def run_indicator(candles):
             if i > z["bar"] and lows[i] <= z["top"]:
                 if i == n - 1:   # tapped on the current (last) bar
                     tapped_last_bar.append({
-                        "zone_id": f"demand_{z['ts']}_{round(z['top'], 6)}",
-                        "side":    "buy",
-                        "entry":   z["entry"],
-                        "sl":      z["sl"],
-                        "tp1":     z["tp1"],
-                        "tp2":     z["tp2"],
-                        "tp3":     z["tp3"],
+                        "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
+                        "side":     "buy",
+                        "zone_top": z["top"],
+                        "zone_bot": z["bot"],
+                        "entry":    z["entry"],
+                        "sl":       z["sl"],
+                        "tp1":      z["tp1"],
+                        "tp2":      z["tp2"],
+                        "tp3":      z["tp3"],
                     })
             else:
                 new_demand.append(z)
@@ -259,13 +261,15 @@ def run_indicator(candles):
             if i > z["bar"] and highs[i] >= z["bot"]:
                 if i == n - 1:   # tapped on the current (last) bar
                     tapped_last_bar.append({
-                        "zone_id": f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                        "side":    "sell",
-                        "entry":   z["entry"],
-                        "sl":      z["sl"],
-                        "tp1":     z["tp1"],
-                        "tp2":     z["tp2"],
-                        "tp3":     z["tp3"],
+                        "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                        "side":     "sell",
+                        "zone_top": z["top"],
+                        "zone_bot": z["bot"],
+                        "entry":    z["entry"],
+                        "sl":       z["sl"],
+                        "tp1":      z["tp1"],
+                        "tp2":      z["tp2"],
+                        "tp3":      z["tp3"],
                     })
             else:
                 new_supply.append(z)
@@ -332,24 +336,28 @@ def run_indicator(candles):
 
     for z in demand_zones:
         active_zones.append({
-            "zone_id": f"demand_{z['ts']}_{round(z['top'], 6)}",
-            "side":    "buy",
-            "entry":   z["entry"],
-            "sl":      z["sl"],
-            "tp1":     z["tp1"],
-            "tp2":     z["tp2"],
-            "tp3":     z["tp3"],
+            "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
+            "side":     "buy",
+            "zone_top": z["top"],
+            "zone_bot": z["bot"],
+            "entry":    z["entry"],
+            "sl":       z["sl"],
+            "tp1":      z["tp1"],
+            "tp2":      z["tp2"],
+            "tp3":      z["tp3"],
         })
 
     for z in supply_zones:
         active_zones.append({
-            "zone_id": f"supply_{z['ts']}_{round(z['bot'], 6)}",
-            "side":    "sell",
-            "entry":   z["entry"],
-            "sl":      z["sl"],
-            "tp1":     z["tp1"],
-            "tp2":     z["tp2"],
-            "tp3":     z["tp3"],
+            "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
+            "side":     "sell",
+            "zone_top": z["top"],
+            "zone_bot": z["bot"],
+            "entry":    z["entry"],
+            "sl":       z["sl"],
+            "tp1":      z["tp1"],
+            "tp2":      z["tp2"],
+            "tp3":      z["tp3"],
         })
 
     # ── Check live candle for immediate zone taps ──
@@ -360,25 +368,29 @@ def run_indicator(candles):
     for z in demand_zones:
         if live_low <= z["top"]:
             live_taps.append({
-                "zone_id": f"demand_{z['ts']}_{round(z['top'], 6)}",
-                "side":    "buy",
-                "entry":   z["entry"],
-                "sl":      z["sl"],
-                "tp1":     z["tp1"],
-                "tp2":     z["tp2"],
-                "tp3":     z["tp3"],
+                "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
+                "side":     "buy",
+                "zone_top": z["top"],
+                "zone_bot": z["bot"],
+                "entry":    z["entry"],
+                "sl":       z["sl"],
+                "tp1":      z["tp1"],
+                "tp2":      z["tp2"],
+                "tp3":      z["tp3"],
             })
 
     for z in supply_zones:
         if live_high >= z["bot"]:
             live_taps.append({
-                "zone_id": f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                "side":    "sell",
-                "entry":   z["entry"],
-                "sl":      z["sl"],
-                "tp1":     z["tp1"],
-                "tp2":     z["tp2"],
-                "tp3":     z["tp3"],
+                "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                "side":     "sell",
+                "zone_top": z["top"],
+                "zone_bot": z["bot"],
+                "entry":    z["entry"],
+                "sl":       z["sl"],
+                "tp1":      z["tp1"],
+                "tp2":      z["tp2"],
+                "tp3":      z["tp3"],
             })
 
     return active_zones, tapped_last_bar, live_taps
@@ -431,12 +443,14 @@ def handle_shutdown(signum, frame):
 def send_discord_alert(symbol, timeframe, zone):
     """Send a formatted Discord embed for a new Potential Entry Zone."""
 
-    side  = zone["side"]
-    entry = zone["entry"]
-    sl    = zone["sl"]
-    tp1   = zone["tp1"]
-    tp2   = zone["tp2"]
-    tp3   = zone["tp3"]
+    side      = zone["side"]
+    zone_top  = zone["zone_top"]
+    zone_bot  = zone["zone_bot"]
+    entry     = zone["entry"]
+    sl        = zone["sl"]
+    tp1       = zone["tp1"]
+    tp2       = zone["tp2"]
+    tp3       = zone["tp3"]
 
     is_long    = side == "buy"
     color      = 0x00C853 if is_long else 0xD50000   # green / red
@@ -461,6 +475,8 @@ def send_discord_alert(symbol, timeframe, zone):
     if tp2 is None and tp3 is None:
         tp_note = "\n*TP1 is fallback (no opposing zones found)*"
 
+    zone_range = f"`{round(zone_bot, 6)}  —  {round(zone_top, 6)}`"
+
     fields = [
         {
             "name":   "Direction",
@@ -468,8 +484,8 @@ def send_discord_alert(symbol, timeframe, zone):
             "inline": False
         },
         {
-            "name":   "Entry",
-            "value":  f"`{round(entry, 6)}`",
+            "name":   "Zone (Entry Range)",
+            "value":  zone_range,
             "inline": True
         },
         {
@@ -514,12 +530,14 @@ def send_discord_alert(symbol, timeframe, zone):
 def send_discord_tap_alert(symbol, timeframe, zone_info):
     """Send a Discord alert when price taps (enters) a tracked zone."""
 
-    side    = zone_info["side"]
-    entry   = zone_info["entry"]
-    sl      = zone_info["sl"]
-    tp1     = zone_info["tp1"]
-    tp2     = zone_info.get("tp2")
-    tp3     = zone_info.get("tp3")
+    side      = zone_info["side"]
+    zone_top  = zone_info.get("zone_top", zone_info["entry"])
+    zone_bot  = zone_info.get("zone_bot", zone_info["entry"])
+    entry     = zone_info["entry"]
+    sl        = zone_info["sl"]
+    tp1       = zone_info["tp1"]
+    tp2       = zone_info.get("tp2")
+    tp3       = zone_info.get("tp3")
 
     is_long   = side == "buy"
     direction = "LONG  —  Demand Zone" if is_long else "SHORT  —  Supply Zone"
@@ -536,6 +554,8 @@ def send_discord_tap_alert(symbol, timeframe, zone_info):
         rr3 = round(abs(tp3 - entry) / sl_dist, 2) if sl_dist > 0 else "—"
         tp_lines.append(f"`{round(tp3, 6)}`  *(1:{rr3}R)*")
 
+    zone_range = f"`{round(zone_bot, 6)}  —  {round(zone_top, 6)}`"
+
     fields = [
         {
             "name":   "Direction",
@@ -543,8 +563,8 @@ def send_discord_tap_alert(symbol, timeframe, zone_info):
             "inline": False
         },
         {
-            "name":   "Entry",
-            "value":  f"`{round(entry, 6)}`",
+            "name":   "Zone (Entry Range)",
+            "value":  zone_range,
             "inline": True
         },
         {
