@@ -185,16 +185,17 @@ def calc_trends(pivot_highs_fire, pivot_lows_fire, n, stability=1):
             (pivot_lows_fire[i]  is not None and pl2 is not None and pivot_lows_fire[i]  < pl2)
         )
 
+        # Pine Script uses two SEPARATE if-statements — bear runs after bull on same bar
         if bull_pivot:
             bull_count += 1
             bear_count  = 0
-        elif bear_pivot:
+        if bear_pivot:
             bear_count += 1
             bull_count  = 0
 
         if bull_count >= stability and curr_trend != 1:
             curr_trend = 1
-        elif bear_count >= stability and curr_trend != -1:
+        if bear_count >= stability and curr_trend != -1:
             curr_trend = -1
 
         trends[i] = curr_trend
@@ -247,6 +248,44 @@ def find_base_candle(opens, highs, lows, closes, impulse_bar, side):
     return highs[fb], lows[fb]
 
 
+def detect_inside_fvg(highs, lows, closes, n, recent_bars=100):
+    """
+    Fix B: check whether the most recent close is inside an active recent FVG.
+    Bull FVG: low[i] > high[i-2]  → gap_top = low[i],   gap_bot = high[i-2]
+    Bear FVG: high[i] < low[i-2]  → gap_top = low[i-2], gap_bot = high[i]
+    A FVG is filled (removed) when price returns to its level.
+    Returns True if last close sits inside any FVG created within recent_bars.
+    """
+    bull_fvgs = []   # (top, bot, created_bar)
+    bear_fvgs = []
+
+    for i in range(2, n):
+        # Remove FVGs that have been filled
+        bull_fvgs = [(t, b, c) for t, b, c in bull_fvgs
+                     if not (i > c and lows[i] <= t)]
+        bear_fvgs = [(t, b, c) for t, b, c in bear_fvgs
+                     if not (i > c and highs[i] >= b)]
+
+        # Detect new FVGs
+        if lows[i] > highs[i - 2]:            # bull imbalance
+            gap_top, gap_bot = lows[i], highs[i - 2]
+            if gap_top > gap_bot:
+                bull_fvgs.append((gap_top, gap_bot, i))
+        if highs[i] < lows[i - 2]:            # bear imbalance
+            gap_top, gap_bot = lows[i - 2], highs[i]
+            if gap_top > gap_bot:
+                bear_fvgs.append((gap_top, gap_bot, i))
+
+    last_close = closes[n - 1]
+    for top, bot, created in bull_fvgs:
+        if (n - 1 - created) < recent_bars and bot <= last_close <= top:
+            return True
+    for top, bot, created in bear_fvgs:
+        if (n - 1 - created) < recent_bars and bot <= last_close <= top:
+            return True
+    return False
+
+
 def compute_htf_trend(candles):
     """
     Fix F: compute trend state on HTF candles.
@@ -264,18 +303,25 @@ def compute_htf_trend(candles):
     return trends[-1]
 
 
-def run_indicator(candles, htf_trend=0):
+def run_indicator(candles):
     """
-    Upgraded FARUEXEE indicator with Fixes C/D/E/G/H/I/J applied.
+    FARUEXEE indicator — fully aligned with Pine Script (Fixes C/D/E/G/H/I/J/B).
 
-    htf_trend : 1 = HTF uptrend, -1 = HTF downtrend, 0 = no filter
-    Returns    : (active_zones, tapped_last_bar, live_taps)
+    Key alignment points vs Pine Script:
+    • Zones created WITHOUT HTF filter (Pine Script draws all zones regardless of HTF)
+    • HTF filter is applied in run_bot() when deciding to send tap alerts
+    • Tap fires only on CLOSED bar with REJECTION CLOSE (close > top for demand,
+      close < bot for supply) — matching Pine Script: low<=bestTop and close>bestTop
+    • Only the CLOSEST qualifying zone fires per side (Fix A matching)
+    • No live-candle tap detection — Pine Script only fires on confirmed closed bars
+    • FVG detection included — returned so run_bot() can apply the filter
+
+    Returns: (active_zones, tapped_zones, inside_fvg)
     """
-    live_candle = candles[-1]
-    candles     = candles[:-1]      # only closed candles for zone detection
+    candles = candles[:-1]          # drop live candle — closed bars only
 
     if len(candles) < LOOKBACK * 2 + 10:
-        return [], [], []
+        return [], [], False
 
     opens   = [float(c[1]) for c in candles]
     highs   = [float(c[2]) for c in candles]
@@ -285,60 +331,48 @@ def run_indicator(candles, htf_trend=0):
     ts      = [c[0]        for c in candles]
     n       = len(candles)
 
-    # ── Fix C: avgBody uses PRIOR bar's 20-bar average ──
+    # ── Fix C: avgBody[1] — 20-bar SMA ending at PRIOR bar ──
     avg_bodies = []
     for i in range(n):
-        start  = max(0, i - 19)
-        bodies = [abs(closes[j] - opens[j]) for j in range(start, i + 1)]
-        avg_bodies.append(sum(bodies) / len(bodies))
-    # avg_bodies[i-1] is used when evaluating bar i (Pine: avgBody[1])
+        start = max(0, i - 19)
+        avg_bodies.append(
+            sum(abs(closes[j] - opens[j]) for j in range(start, i + 1)) / (i - start + 1)
+        )
 
-    # ── Fix J: 20-bar volume SMA (prior bar) ──
+    # ── Fix J: volume SMA[1] — 20-bar volume SMA ending at PRIOR bar ──
     vol_sma = []
     for i in range(n):
         start = max(0, i - 19)
         vol_sma.append(sum(volumes[start:i + 1]) / (i - start + 1))
-    # vol_sma[i-1] is used when evaluating bar i
 
     # ── Fix E: ATR ──
     atr = calc_atr(highs, lows, closes, ATR_LEN)
 
-    # ── Trend ──
+    # ── Trend with Fix H stability gate ──
     pivot_highs_fire = find_pivot_highs(highs, LOOKBACK)
     pivot_lows_fire  = find_pivot_lows(lows,   LOOKBACK)
     trends           = calc_trends(pivot_highs_fire, pivot_lows_fire, n,
                                    stability=TREND_STABILITY)
 
-    demand_zones    = []
-    supply_zones    = []
-    demand_reg      = []
-    supply_reg      = []
-    tapped_last_bar = []
+    demand_zones = []
+    supply_zones = []
+    demand_reg   = []
+    supply_reg   = []
+    tapped_cands = []     # candidate tap alerts — post-filtered to closest per side
 
     for i in range(max(7, LOOKBACK * 2 + 1), n):
-        # ── Fix C: use prior bar's avgBody ──
-        avg_body = avg_bodies[i - 1] if i > 0 else avg_bodies[i]
-        trend    = trends[i]
-        o = opens[i]; h = highs[i]; l = lows[i]; c = closes[i]
+        avg_body      = avg_bodies[i - 1]   # Fix C: prior bar average
+        prior_vol_sma = vol_sma[i - 1]      # Fix J: prior bar volume SMA
+        trend         = trends[i]
+        o = opens[i]; c = closes[i]
 
-        # ── Fix J: volume confirmation ──
-        prior_vol_sma = vol_sma[i - 1] if i > 0 else vol_sma[i]
-        vol_ok = (not True) or (volumes[i] >= prior_vol_sma * VOLUME_MULT)
-        # ↑ USE_BASE_CANDLE is a separate toggle; vol_ok uses VOLUME_MULT always
-        vol_ok = volumes[i] >= prior_vol_sma * VOLUME_MULT
-
+        vol_ok       = volumes[i] >= prior_vol_sma * VOLUME_MULT
         bull_impulse = (c > o) and ((c - o) >= avg_body * IMPULSE_STRENGTH) and vol_ok
         bear_impulse = (c < o) and ((o - c) >= avg_body * IMPULSE_STRENGTH) and vol_ok
+        bull_gap     = lows[i]  > highs[i - 2]
+        bear_gap     = highs[i] < lows[i - 2]
 
-        bull_gap = lows[i]  > highs[i - 2]
-        bear_gap = highs[i] < lows[i - 2]
-
-        # ── HTF filter ──
-        htf_bull_ok = (not USE_HTF_FILTER) or (htf_trend == 0) or (htf_trend == 1)
-        htf_bear_ok = (not USE_HTF_FILTER) or (htf_trend == 0) or (htf_trend == -1)
-
-        # ── Fix G: tap logic with 2nd-test tracking ──
-        # was_in prevents re-counting the same tap while price stays in zone
+        # ── Fix G: demand tap tracking (wasIn prevents double-counting) ──
         new_demand = []
         for z in demand_zones:
             was_in  = z.get("was_in", False)
@@ -348,12 +382,12 @@ def run_indicator(candles, htf_trend=0):
             if new_tap:
                 new_taps = z.get("taps", 0) + 1
                 if FIRE_ON_2ND_TEST and new_taps < 2:
-                    # 1st tap — keep zone alive, mark tested
                     new_demand.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    # 2nd tap (or 1st if FIRE_ON_2ND_TEST=False) — fire if last bar
-                    if i == n - 1:
-                        tapped_last_bar.append({
+                    # Ready to fire — but only if rejection close on last bar
+                    # Pine Script: low <= bestTop AND close > bestTop
+                    if i == n - 1 and closes[i] > z["top"]:
+                        tapped_cands.append({
                             "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
                             "side":     "buy",
                             "zone_top": z["top"],
@@ -364,13 +398,14 @@ def run_indicator(candles, htf_trend=0):
                             "tp2":      z["tp2"],
                             "tp3":      z["tp3"],
                         })
-                    # zone consumed — do not re-append
+                    # zone consumed regardless
             elif is_in:
-                new_demand.append({**z, "was_in": True})   # still inside
+                new_demand.append({**z, "was_in": True})
             else:
-                new_demand.append({**z, "was_in": False})  # price exited, reset
+                new_demand.append({**z, "was_in": False})
         demand_zones = new_demand
 
+        # ── Fix G: supply tap tracking ──
         new_supply = []
         for z in supply_zones:
             was_in  = z.get("was_in", False)
@@ -382,8 +417,9 @@ def run_indicator(candles, htf_trend=0):
                 if FIRE_ON_2ND_TEST and new_taps < 2:
                     new_supply.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    if i == n - 1:
-                        tapped_last_bar.append({
+                    # Pine Script: high >= bestBot AND close < bestBot
+                    if i == n - 1 and closes[i] < z["bot"]:
+                        tapped_cands.append({
                             "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
                             "side":     "sell",
                             "zone_top": z["top"],
@@ -405,35 +441,25 @@ def run_indicator(candles, htf_trend=0):
         supply_reg = [z for z in supply_reg
                       if not (i > z["bar"] and highs[i] >= z["bot"])]
 
-        # ── Demand Zone (bullImpulse + uptrend + HTF OK) ──
-        if bull_impulse and trend == 1 and htf_bull_ok:
-            # Fix I: origin block candle
-            if USE_BASE_CANDLE:
-                z_top, z_bot = find_base_candle(opens, highs, lows, closes, i, "bull")
-            else:
-                z_top, z_bot = highs[i - 1], lows[i - 1]
-
-            min_height = atr[i] * 0.05 if atr[i] > 0 else 0
-            if z_top > z_bot and (z_top - z_bot) > min_height:
-                # Fix E: ATR SL
+        # ── Zone creation — NO HTF filter (Pine Script draws zones unconditionally) ──
+        if bull_impulse and trend == 1:
+            z_top, z_bot = find_base_candle(opens, highs, lows, closes, i, "bull") \
+                           if USE_BASE_CANDLE else (highs[i - 1], lows[i - 1])
+            min_h = atr[i] * 0.05 if atr[i] > 0 else 0
+            if z_top > z_bot and (z_top - z_bot) > min_h:
                 sl_px = (z_bot - atr[i] * ATR_MULT) if USE_ATR_SL \
                         else (z_bot - (z_top - z_bot) * SL_BUFFER)
                 entry = z_top
-
                 if bull_gap:
                     tp_cands = sorted(
                         [z["bot"] for z in supply_zones if z["bot"] > entry] +
                         [z["bot"] for z in supply_reg   if z["bot"] > entry]
                     )
-                    tp1 = tp_cands[0] if tp_cands \
-                          else entry + (entry - sl_px) * TP_MULTI
+                    tp1 = tp_cands[0] if tp_cands else entry + (entry - sl_px) * TP_MULTI
                     tp2 = tp_cands[1] if len(tp_cands) >= 2 else None
                     tp3 = tp_cands[2] if len(tp_cands) >= 3 else None
-
-                    # Fix D: minimum R:R
-                    sl_dist = entry - sl_px
-                    rr = (tp1 - entry) / sl_dist if sl_dist > 0 else 0
-                    if rr >= MIN_RR:
+                    sl_d = entry - sl_px
+                    if sl_d > 0 and (tp1 - entry) / sl_d >= MIN_RR:   # Fix D
                         demand_zones.append({
                             "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
                             "entry": entry, "sl": sl_px,
@@ -443,34 +469,25 @@ def run_indicator(candles, htf_trend=0):
                 else:
                     demand_reg.append({"bar": i, "top": z_top, "bot": z_bot})
 
-        # ── Supply Zone (bearImpulse + downtrend + HTF OK) ──
-        if bear_impulse and trend == -1 and htf_bear_ok:
-            if USE_BASE_CANDLE:
-                z_top, z_bot = find_base_candle(opens, highs, lows, closes, i, "bear")
-            else:
-                z_top, z_bot = highs[i - 1], lows[i - 1]
-
-            min_height = atr[i] * 0.05 if atr[i] > 0 else 0
-            if z_top > z_bot and (z_top - z_bot) > min_height:
+        if bear_impulse and trend == -1:
+            z_top, z_bot = find_base_candle(opens, highs, lows, closes, i, "bear") \
+                           if USE_BASE_CANDLE else (highs[i - 1], lows[i - 1])
+            min_h = atr[i] * 0.05 if atr[i] > 0 else 0
+            if z_top > z_bot and (z_top - z_bot) > min_h:
                 sl_px = (z_top + atr[i] * ATR_MULT) if USE_ATR_SL \
                         else (z_top + (z_top - z_bot) * SL_BUFFER)
                 entry = z_bot
-
                 if bear_gap:
                     tp_cands = sorted(
                         [z["top"] for z in demand_zones if z["top"] < entry] +
                         [z["top"] for z in demand_reg   if z["top"] < entry],
                         reverse=True
                     )
-                    tp1 = tp_cands[0] if tp_cands \
-                          else entry - (sl_px - entry) * TP_MULTI
+                    tp1 = tp_cands[0] if tp_cands else entry - (sl_px - entry) * TP_MULTI
                     tp2 = tp_cands[1] if len(tp_cands) >= 2 else None
                     tp3 = tp_cands[2] if len(tp_cands) >= 3 else None
-
-                    # Fix D: minimum R:R
-                    sl_dist = sl_px - entry
-                    rr = (entry - tp1) / sl_dist if sl_dist > 0 else 0
-                    if rr >= MIN_RR:
+                    sl_d = sl_px - entry
+                    if sl_d > 0 and (entry - tp1) / sl_d >= MIN_RR:   # Fix D
                         supply_zones.append({
                             "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
                             "entry": entry, "sl": sl_px,
@@ -480,9 +497,8 @@ def run_indicator(candles, htf_trend=0):
                 else:
                     supply_reg.append({"bar": i, "top": z_top, "bot": z_bot})
 
-    # ── Collect all active Potential Entry Zones ──
+    # ── Collect active zones ──
     active_zones = []
-
     for z in demand_zones:
         active_zones.append({
             "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
@@ -495,7 +511,6 @@ def run_indicator(candles, htf_trend=0):
             "tp2":      z["tp2"],
             "tp3":      z["tp3"],
         })
-
     for z in supply_zones:
         active_zones.append({
             "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
@@ -509,47 +524,25 @@ def run_indicator(candles, htf_trend=0):
             "tp3":      z["tp3"],
         })
 
-    # ── Live candle tap detection ──
-    # Fix G: live tap only qualifies on zones at the right tap count
-    live_high = float(live_candle[2])
-    live_low  = float(live_candle[3])
-    live_taps = []
+    # ── Fix A: select CLOSEST qualifying zone per side (match Pine Script) ──
+    # Demand: highest zone_top (closest demand below current close)
+    # Supply: lowest zone_bot  (closest supply above current close)
+    tapped_zones = []
+    best_demand  = max(
+        (z for z in tapped_cands if z["side"] == "buy"),
+        key=lambda z: z["zone_top"], default=None
+    )
+    best_supply  = min(
+        (z for z in tapped_cands if z["side"] == "sell"),
+        key=lambda z: z["zone_bot"], default=None
+    )
+    if best_demand: tapped_zones.append(best_demand)
+    if best_supply: tapped_zones.append(best_supply)
 
-    for z in demand_zones:
-        already_tapped = z.get("taps", 0)
-        qualifies = (FIRE_ON_2ND_TEST and already_tapped >= 1) or \
-                    (not FIRE_ON_2ND_TEST and already_tapped == 0)
-        if qualifies and live_low <= z["top"]:
-            live_taps.append({
-                "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
-                "side":     "buy",
-                "zone_top": z["top"],
-                "zone_bot": z["bot"],
-                "entry":    z["entry"],
-                "sl":       z["sl"],
-                "tp1":      z["tp1"],
-                "tp2":      z["tp2"],
-                "tp3":      z["tp3"],
-            })
+    # ── Fix B: FVG detection ──
+    inside_fvg = detect_inside_fvg(highs, lows, closes, n)
 
-    for z in supply_zones:
-        already_tapped = z.get("taps", 0)
-        qualifies = (FIRE_ON_2ND_TEST and already_tapped >= 1) or \
-                    (not FIRE_ON_2ND_TEST and already_tapped == 0)
-        if qualifies and live_high >= z["bot"]:
-            live_taps.append({
-                "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                "side":     "sell",
-                "zone_top": z["top"],
-                "zone_bot": z["bot"],
-                "entry":    z["entry"],
-                "sl":       z["sl"],
-                "tp1":      z["tp1"],
-                "tp2":      z["tp2"],
-                "tp3":      z["tp3"],
-            })
-
-    return active_zones, tapped_last_bar, live_taps
+    return active_zones, tapped_zones, inside_fvg
 
 
 # =============================================================
@@ -822,62 +815,68 @@ def run_bot():
                     htf_label   = "UP" if htf_trend == 1 else "DOWN" if htf_trend == -1 else "NEUTRAL"
                     print(f"  HTF ({htf_tf}) trend : {htf_label}")
 
-            active_zones, tapped_zones, live_taps = run_indicator(candles, htf_trend=htf_trend)
-            active_zone_ids  = {z["zone_id"] for z in active_zones}
-            tapped_zone_ids  = {z["zone_id"]: z for z in tapped_zones}
+            active_zones, tapped_zones, inside_fvg = run_indicator(candles)
+            active_zone_ids = {z["zone_id"] for z in active_zones}
 
             print(f"  Active zones : {len(active_zones)}")
             if tapped_zones:
                 print(f"  Tapped zones : {len(tapped_zones)}")
-            if live_taps:
-                print(f"  Live taps    : {len(live_taps)}")
+            if inside_fvg:
+                print(f"  Inside FVG   : yes (tap alerts blocked)")
             zones_found += len(active_zones)
 
-            # ── Handle zones that are no longer active ──
+            # ── Clean up state records for zones no longer active ──
             stale_keys = [
-                k for k, v in state.items()
-                if k.startswith(key_prefix)
-                and not k.startswith(f"{key_prefix}_liveTap_")
+                k for k, v in list(state.items())
+                if k.startswith(f"{key_prefix}_")
+                and "_tapAlerted_" not in k
                 and v.get("zone_id") not in active_zone_ids
             ]
             for k in stale_keys:
-                zone_id   = state[k].get("zone_id")
-                zone_info = tapped_zone_ids.get(zone_id)
+                zone_id = state[k].get("zone_id", "")
+                print(f"  Zone expired — removing: {zone_id[:50]}...")
+                del state[k]
+                tap_key = f"{key_prefix}_tapAlerted_{zone_id}"
+                if tap_key in state:
+                    del state[tap_key]
 
-                if zone_info:
-                    # Zone was tapped on a closed candle — send tap alert
-                    print(f"\n  Zone Tapped (closed candle)! Sending alert...")
-                    success = send_discord_tap_alert(symbol, tf, zone_info)
+            if not _is_first_run:
+                # ── Tap alerts — closed bar, rejection close, HTF + FVG filtered ──
+                for zone in tapped_zones:
+                    tap_key = f"{key_prefix}_tapAlerted_{zone['zone_id']}"
+                    if tap_key in state:
+                        continue   # already alerted for this zone tap
+
+                    # Fix F: HTF filter — only alert when HTF trend agrees
+                    if USE_HTF_FILTER and htf_trend != 0:
+                        if zone["side"] == "buy"  and htf_trend != 1:
+                            print(f"  Tap blocked — HTF not uptrend: {zone['zone_id'][:40]}...")
+                            continue
+                        if zone["side"] == "sell" and htf_trend != -1:
+                            print(f"  Tap blocked — HTF not downtrend: {zone['zone_id'][:40]}...")
+                            continue
+
+                    # Fix B: FVG filter — block if price inside recent imbalance
+                    if inside_fvg:
+                        print(f"  Tap blocked — price inside FVG: {zone['zone_id'][:40]}...")
+                        continue
+
+                    side = zone["side"]
+                    print(f"\n  Zone Tapped! {'⬆️ LONG' if side == 'buy' else '⬇️ SHORT'}")
+                    print(f"  Zone  : {round(zone['zone_bot'], 6)}  —  {round(zone['zone_top'], 6)}")
+                    print(f"  SL    : {round(zone['sl'], 6)}")
+                    print(f"  TP1   : {round(zone['tp1'], 6)}")
+
+                    success = send_discord_tap_alert(symbol, tf, zone)
                     if success:
                         print(f"  Tap alert sent!")
+                        alerts_sent += 1
+                        state[tap_key] = {
+                            "zone_id":    zone["zone_id"],
+                            "alerted_at": datetime.now().isoformat(),
+                        }
                     else:
-                        print(f"  [ERROR] Tap alert failed.")
-                else:
-                    print(f"  Zone expired — removing from state: {k}")
-
-                del state[k]
-                # also clean up any live tap state for this zone
-                live_tap_key = f"{key_prefix}_liveTap_{zone_id}"
-                if live_tap_key in state:
-                    del state[live_tap_key]
-
-            # ── Immediate tap alerts — live candle touching zone ──
-            for zone in live_taps:
-                live_tap_key = f"{key_prefix}_liveTap_{zone['zone_id']}"
-
-                if live_tap_key in state:
-                    continue   # already alerted for this touch — skip
-
-                print(f"\n  Zone Tapped (live candle)! Sending immediate alert...")
-                success = send_discord_tap_alert(symbol, tf, zone)
-                if success:
-                    print(f"  Immediate tap alert sent!")
-                    state[live_tap_key] = {
-                        "zone_id":    zone["zone_id"],
-                        "alerted_at": datetime.now().isoformat()
-                    }
-                else:
-                    print(f"  [ERROR] Immediate tap alert failed.")
+                        print(f"  [ERROR] Tap alert failed — will retry next run.")
 
             # ── Alert for new zones ──
             for zone in active_zones:
