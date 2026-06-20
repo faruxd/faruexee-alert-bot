@@ -73,7 +73,7 @@ ATR_LEN           = 14     # Fix E — ATR period
 ATR_MULT          = 0.5    # Fix E — ATR SL multiplier
 SL_BUFFER         = 0.25   # Fallback SL buffer × zone height (only when ATR disabled)
 MIN_RR            = 1.5    # Fix D — reject zones where TP1 < N × SL distance
-FIRE_ON_2ND_TEST  = True   # Fix G — alert on 2nd zone tap, not 1st (classic SD logic)
+FIRE_ON_2ND_TEST  = False  # Fire on first tap (immediate alert mode)
 USE_HTF_FILTER    = True   # Fix F — only alert when HTF trend agrees
 
 HTF_MAP = {                # Fix F — which HTF to check per scanning timeframe
@@ -305,20 +305,20 @@ def compute_htf_trend(candles):
 
 def run_indicator(candles):
     """
-    FARUEXEE indicator — fully aligned with Pine Script (Fixes C/D/E/G/H/I/J/B).
+    FARUEXEE indicator — IMMEDIATE TAP ALERT MODE.
 
-    Key alignment points vs Pine Script:
-    • Zones created WITHOUT HTF filter (Pine Script draws all zones regardless of HTF)
-    • HTF filter is applied in run_bot() when deciding to send tap alerts
-    • Tap fires only on CLOSED bar with REJECTION CLOSE (close > top for demand,
-      close < bot for supply) — matching Pine Script: low<=bestTop and close>bestTop
-    • Only the CLOSEST qualifying zone fires per side (Fix A matching)
-    • No live-candle tap detection — Pine Script only fires on confirmed closed bars
-    • FVG detection included — returned so run_bot() can apply the filter
+    Tap detection rules:
+    • Fires the MOMENT price touches the zone — no waiting for candle close
+    • Fires on first tap (FIRE_ON_2ND_TEST=False)
+    • No rejection-close requirement
+    • Live candle is checked against all active zones — alert fires on touch
+    • Deduplication happens in run_bot() via _tapAlerted_{zone_id} state key
+      — guarantees only ONE alert per zone
 
     Returns: (active_zones, tapped_zones, inside_fvg)
     """
-    candles = candles[:-1]          # drop live candle — closed bars only
+    live_candle = candles[-1]       # save live candle for immediate tap detection
+    candles     = candles[:-1]      # closed bars only for zone building
 
     if len(candles) < LOOKBACK * 2 + 10:
         return [], [], False
@@ -384,9 +384,8 @@ def run_indicator(candles):
                 if FIRE_ON_2ND_TEST and new_taps < 2:
                     new_demand.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    # Ready to fire — but only if rejection close on last bar
-                    # Pine Script: low <= bestTop AND close > bestTop
-                    if i == n - 1 and closes[i] > z["top"]:
+                    # Fire on first tap (no rejection close required)
+                    if i == n - 1:
                         tapped_cands.append({
                             "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
                             "side":     "buy",
@@ -417,8 +416,8 @@ def run_indicator(candles):
                 if FIRE_ON_2ND_TEST and new_taps < 2:
                     new_supply.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    # Pine Script: high >= bestBot AND close < bestBot
-                    if i == n - 1 and closes[i] < z["bot"]:
+                    # Fire on first tap (no rejection close required)
+                    if i == n - 1:
                         tapped_cands.append({
                             "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
                             "side":     "sell",
@@ -524,20 +523,52 @@ def run_indicator(candles):
             "tp3":      z["tp3"],
         })
 
-    # ── Fix A: select CLOSEST qualifying zone per side (match Pine Script) ──
-    # Demand: highest zone_top (closest demand below current close)
-    # Supply: lowest zone_bot  (closest supply above current close)
+    # ── Immediate live candle tap detection ──
+    # Check live (unconfirmed) candle against all active zones.
+    # Fires the moment price wicks into the zone — no waiting for close.
+    live_high = float(live_candle[2])
+    live_low  = float(live_candle[3])
+
+    for z in demand_zones:
+        if live_low <= z["top"]:
+            # In 2nd-test mode, skip if zone hasn't been tapped at least once
+            if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
+                continue
+            tapped_cands.append({
+                "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
+                "side":     "buy",
+                "zone_top": z["top"],
+                "zone_bot": z["bot"],
+                "entry":    z["entry"],
+                "sl":       z["sl"],
+                "tp1":      z["tp1"],
+                "tp2":      z["tp2"],
+                "tp3":      z["tp3"],
+            })
+
+    for z in supply_zones:
+        if live_high >= z["bot"]:
+            if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
+                continue
+            tapped_cands.append({
+                "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                "side":     "sell",
+                "zone_top": z["top"],
+                "zone_bot": z["bot"],
+                "entry":    z["entry"],
+                "sl":       z["sl"],
+                "tp1":      z["tp1"],
+                "tp2":      z["tp2"],
+                "tp3":      z["tp3"],
+            })
+
+    # Dedupe — closed-bar tap and live tap can pick up the same zone in one scan
+    seen         = set()
     tapped_zones = []
-    best_demand  = max(
-        (z for z in tapped_cands if z["side"] == "buy"),
-        key=lambda z: z["zone_top"], default=None
-    )
-    best_supply  = min(
-        (z for z in tapped_cands if z["side"] == "sell"),
-        key=lambda z: z["zone_bot"], default=None
-    )
-    if best_demand: tapped_zones.append(best_demand)
-    if best_supply: tapped_zones.append(best_supply)
+    for z in tapped_cands:
+        if z["zone_id"] not in seen:
+            seen.add(z["zone_id"])
+            tapped_zones.append(z)
 
     # ── Fix B: FVG detection ──
     inside_fvg = detect_inside_fvg(highs, lows, closes, n)
