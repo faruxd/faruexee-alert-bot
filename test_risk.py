@@ -331,6 +331,109 @@ def test_engine():
 #   TP LADDER
 # =============================================================
 
+def test_tp_coverage():
+    """
+    The ladder must always cover the WHOLE position.
+
+    Regression: slices were computed as floats and floored individually,
+    so 0.4 on a 0.1 grid produced 0.2 + 0.1 and silently dropped the last
+    0.1 to float error — a quarter of the position left with no target,
+    exiting only via the stop. Coarse grids (SOL 0.1, XRP 1) made this the
+    normal case on a small account, not an edge case.
+    """
+    print("\nTake-profit ladder covers the full position")
+
+    class RecordingClient(BitgetClient):
+        def __init__(self):
+            super().__init__("", "", "")
+            self._specs = dict(FAKE_SPECS)
+            self.placed = []
+
+        def place_partial_tp(self, symbol, hold_side, size, trigger_price, **kw):
+            self.placed.append(size)
+            return {}
+
+    import faruexee_trade_bot as T
+
+    cases = [
+        ("SOLUSDT", [0.1, 0.2, 0.3, 0.4, 0.7, 1.1, 22.9, 5.5]),
+        ("XRPUSDT", [1, 2, 3, 5, 7, 37, 93, 137]),
+        ("BTCUSDT", [0.0001, 0.0002, 0.0003, 0.0008, 0.0021, 0.0137]),
+    ]
+
+    all_ok = True
+    for symbol, sizes in cases:
+        for size in sizes:
+            for tp2, tp3 in ((97.0, 96.0), (None, None), (97.0, None)):
+                bot = T.TradeBot.__new__(T.TradeBot)
+                bot.cfg = EngineConfig()
+                bot.client = RecordingClient()
+                bot.live = True
+                bot.offline = False
+                bot.equity = 1000.0
+                bot.state = {"orders": {}, "positions": {},
+                             "daily": {"date": T.utc_date(), "start_equity": 1000.0},
+                             "halted": False, "halt_reason": "",
+                             "baseline_equity": 1000.0}
+                bot.state["positions"][symbol] = {
+                    "symbol": symbol, "hold_side": "short", "orig_size": size,
+                    "entry": 100.0, "sl": 101.0,
+                    "tp1": 98.0, "tp2": tp2, "tp3": tp3, "tps_placed": False,
+                }
+                import io
+                import contextlib
+                with contextlib.redirect_stdout(io.StringIO()):
+                    bot._place_tp_ladder(symbol)
+
+                total = sum(bot.client.placed)
+                if abs(total - size) > 1e-9:
+                    all_ok = False
+                    check(f"{symbol} size {size} tp2={tp2} fully covered", False,
+                          f"slices={bot.client.placed} sum={total} want={size}")
+
+    check("every position size is fully covered by its TP ladder", all_ok)
+
+    # A ladder must never sell more than the position holds either.
+    bot = T.TradeBot.__new__(T.TradeBot)
+    bot.cfg = EngineConfig()
+    bot.client = RecordingClient()
+    bot.live = True
+    bot.offline = False
+    bot.equity = 1000.0
+    bot.state = {"orders": {}, "positions": {},
+                 "daily": {"date": T.utc_date(), "start_equity": 1000.0},
+                 "halted": False, "halt_reason": "", "baseline_equity": 1000.0}
+    bot.state["positions"]["SOLUSDT"] = {
+        "symbol": "SOLUSDT", "hold_side": "long", "orig_size": 0.3,
+        "entry": 100.0, "sl": 99.0,
+        "tp1": 102.0, "tp2": 103.0, "tp3": 104.0, "tps_placed": False,
+    }
+    import io
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        bot._place_tp_ladder("SOLUSDT")
+    check("ladder never exceeds position size",
+          sum(bot.client.placed) <= 0.3 + 1e-9,
+          f"sum={sum(bot.client.placed)}")
+
+
+def test_size_units():
+    print("\nSize-step arithmetic")
+    c = fake_client()
+    check("0.4 - 0.3 float drift still counts as one step",
+          c.size_units("SOLUSDT", 0.4 - 0.30000000000000004) == 1,
+          c.size_units("SOLUSDT", 0.4 - 0.30000000000000004))
+    check("round_size survives the same drift",
+          c.round_size("SOLUSDT", 0.4 - 0.30000000000000004) == 0.1,
+          c.round_size("SOLUSDT", 0.4 - 0.30000000000000004))
+    check("half a step never rounds up", c.size_units("SOLUSDT", 0.05) == 0,
+          c.size_units("SOLUSDT", 0.05))
+    check("units round-trip to size", c.units_to_size("SOLUSDT", 7) == 0.7,
+          c.units_to_size("SOLUSDT", 7))
+    check("integer grid round-trips", c.units_to_size("XRPUSDT", 37) == 37.0,
+          c.units_to_size("XRPUSDT", 37))
+
+
 def test_tp_ladder():
     print("\nTake-profit ladder")
     bot = make_bot(1000.0)
@@ -380,6 +483,8 @@ if __name__ == "__main__":
     test_caps()
     test_geometry()
     test_engine()
+    test_size_units()
+    test_tp_coverage()
     test_tp_ladder()
     test_config()
 

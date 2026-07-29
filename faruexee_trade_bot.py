@@ -479,16 +479,32 @@ class TradeBot:
 
     def manage_orders(self, analyses):
         """Check every resting entry for fill, expiry or zone invalidation."""
+
+        # An open position is the ground truth for "the order filled".
+        # Matching on an order-state string is fragile: one unexpected
+        # value and the entry silently never gets its take-profits, while
+        # a real position sits on the exchange with only its stop.
+        live_positions = {}
+        if self.live:
+            try:
+                live_positions = {p["symbol"]: p for p in self._positions()}
+            except BitgetError as e:
+                log(f"[WARN] position fetch during order management: {e}")
+
         for oid, rec in list(self.state["orders"].items()):
             sym = rec["symbol"]
 
             # 1. Did it fill?
             filled = False
-            if self.live:
+            live_pos = live_positions.get(sym)
+            if live_pos:
+                filled = True
+            elif self.live:
                 try:
                     detail = self.client.get_order(sym, client_oid=oid)
-                    state = (detail or {}).get("state", "")
-                    if state == "filled":
+                    state = str((detail or {}).get("state", "")).lower()
+                    if state in ("filled", "full_fill", "partially_filled",
+                                 "partial_fill"):
                         filled = True
                     elif state in ("cancelled", "canceled"):
                         log(f"{sym}: order cancelled externally — clearing")
@@ -498,7 +514,7 @@ class TradeBot:
                     log(f"[WARN] order lookup {sym}: {e}")
 
             if filled:
-                self._on_fill(oid, rec)
+                self._on_fill(oid, rec, live_pos)
                 continue
 
             # 2. Expired?
@@ -518,10 +534,36 @@ class TradeBot:
                     self._cancel_order(oid, rec, "zone invalidated or breached")
                     continue
 
-    def _on_fill(self, oid, rec):
+    def _on_fill(self, oid, rec, live_pos=None):
         sym = rec["symbol"]
+
+        # Prefer the exchange's own numbers over what we asked for. On a
+        # partial fill the position is smaller than the order, and sizing
+        # the take-profit ladder from the order size would have the
+        # exchange reject the tail of the ladder.
         hold_side = "long" if rec["side"] == "buy" else "short"
-        log(f"FILLED {sym} {rec['side']} @ {rec['entry']}")
+        filled_size = rec["size"]
+        entry_px = rec["entry"]
+
+        if live_pos:
+            hold_side = live_pos.get("holdSide") or hold_side
+            try:
+                actual = float(live_pos.get("total", 0) or 0)
+                if actual > 0:
+                    if abs(actual - filled_size) > 1e-12:
+                        log(f"{sym}: filled {actual} of {filled_size} ordered")
+                    filled_size = actual
+            except (TypeError, ValueError):
+                pass
+            for key in ("openPriceAvg", "averageOpenPrice", "avgOpenPrice"):
+                try:
+                    if live_pos.get(key):
+                        entry_px = float(live_pos[key])
+                        break
+                except (TypeError, ValueError):
+                    pass
+
+        log(f"FILLED {sym} {rec['side']} @ {entry_px}  size {filled_size}")
 
         self.state["positions"][sym] = {
             "symbol": sym,
@@ -529,11 +571,11 @@ class TradeBot:
             "zone_id": rec["zone_id"],
             "side": rec["side"],
             "hold_side": hold_side,
-            "entry": rec["entry"],
+            "entry": entry_px,
             "sl": rec["sl"],
             "tp1": rec["tp1"], "tp2": rec["tp2"], "tp3": rec["tp3"],
             "rr": rec["rr"],
-            "orig_size": rec["size"],
+            "orig_size": filled_size,
             "risk_usdt": rec["risk_usdt"],
             "opened_at": now_iso(),
             "tps_placed": False,
@@ -546,7 +588,7 @@ class TradeBot:
         pos = self.state["positions"][sym]
         notify(f"Position opened — {sym} {rec['side'].upper()}", [
             f"Timeframe: {rec['timeframe']}",
-            f"Entry: `{rec['entry']}`   Size: `{rec['size']}`",
+            f"Entry: `{pos['entry']}`   Size: `{pos['orig_size']}`",
             f"Stop: `{rec['sl']}`   Risk: `{rec['risk_usdt']:.2f}` {C.MARGIN_COIN}",
             f"TP1: `{rec['tp1']}`" + (f"   TP2: `{rec['tp2']}`" if rec['tp2'] else "")
             + (f"   TP3: `{rec['tp3']}`" if rec['tp3'] else ""),
@@ -554,8 +596,14 @@ class TradeBot:
         ], GREEN if rec["side"] == "buy" else RED)
 
     def _place_tp_ladder(self, sym):
-        """Split the position across TP1/TP2/TP3. The stop is already on the
-        exchange from presetStopLossPrice, so a failure here is not fatal."""
+        """
+        Split the position across TP1/TP2/TP3.
+
+        The stop is already on the exchange from presetStopLossPrice, so a
+        failure here is not fatal — but it does leave the position with no
+        targets, so the flag is only set once something actually lands and
+        the next cycle retries otherwise.
+        """
         pos = self.state["positions"][sym]
         size = pos["orig_size"]
         targets = [(pos["tp1"], C.TP_SPLIT[0]),
@@ -564,19 +612,44 @@ class TradeBot:
         active = [(px, w) for px, w in targets if px is not None]
 
         if not active:
-            return
-        # Only TP1 exists -> put the whole position on it.
-        if len(active) == 1:
-            active = [(active[0][0], 1.0)]
-        else:
-            total_w = sum(w for _, w in active)
-            active = [(px, w / total_w) for px, w in active]
+            return 0
+
+        # Allocate in whole size-steps rather than floats. Splitting a
+        # float position by percentages and flooring each slice loses the
+        # remainder, which leaves part of the position with no target at
+        # all — on a coarse grid (SOL 0.1, XRP 1) that is most of the time.
+        #
+        # Largest-remainder apportionment keeps the intended 50/30/20 shape
+        # while guaranteeing the slices sum to the whole position.
+        total_units = self.client.size_units(sym, size)
+        if total_units <= 0:
+            log(f"[WARN] {sym}: position too small to place any target")
+            return 0
+
+        weights = [w for _, w in active]
+        wsum = sum(weights) or 1.0
+        ideal = [total_units * (w / wsum) for w in weights]
+        alloc = [int(x) for x in ideal]
+
+        remainder = total_units - sum(alloc)
+        if remainder > 0:
+            # Hand spare steps to the nearest targets first — a position
+            # this small should bank the reachable target, not the distant one.
+            order = sorted(range(len(ideal)),
+                           key=lambda i: (ideal[i] - alloc[i], -i), reverse=True)
+            for i in order[:remainder]:
+                alloc[i] += 1
+
+        if sum(alloc) != total_units:
+            log(f"[WARN] {sym}: TP allocation {sum(alloc)} != {total_units} units")
 
         placed = 0.0
-        for idx, (px, weight) in enumerate(active):
-            last = idx == len(active) - 1
-            raw = size - placed if last else size * weight
-            qty = self.client.round_size(sym, raw)
+        ok_count = 0
+        failures = []
+        for idx, ((px, _weight), units) in enumerate(zip(active, alloc)):
+            if units <= 0:
+                continue
+            qty = self.client.units_to_size(sym, units)
             if qty <= 0:
                 continue
             price = self.client.round_price(sym, px)
@@ -589,11 +662,26 @@ class TradeBot:
                     )
                 except BitgetError as e:
                     log(f"[WARN] TP{idx+1} placement failed on {sym}: {e}")
+                    failures.append(f"TP{idx+1}: {e}")
                     continue
             placed += qty
+            ok_count += 1
             log(f"  TP{idx+1} {sym}: {qty} @ {price}")
 
-        pos["tps_placed"] = True
+        # Only consider the ladder done if something actually landed.
+        # Otherwise manage_positions retries on the next cycle.
+        pos["tps_placed"] = ok_count > 0 or not self.live
+
+        if failures and self.live:
+            notify(f"Take-profit placement problem — {sym}", [
+                f"{ok_count} of {len(active)} targets placed.",
+                *failures,
+                "",
+                "The stop loss is on the exchange and unaffected.",
+                "The bot will retry the missing targets next cycle.",
+            ], ORANGE)
+
+        return ok_count
 
     # ---------------------------------------------------------
     #   POSITION MANAGEMENT
@@ -618,6 +706,13 @@ class TradeBot:
 
             live = live_positions[sym]
             remaining = float(live.get("total", 0) or 0)
+
+            # Retry a ladder that failed to land on the previous cycle,
+            # so a transient API error does not leave a live position
+            # running with no targets at all.
+            if not pos.get("tps_placed"):
+                log(f"{sym}: take-profit ladder incomplete — retrying")
+                self._place_tp_ladder(sym)
 
             # Partial fill on TP1 shrinks the position — move the stop to
             # break-even so the rest of the trade cannot become a loser.

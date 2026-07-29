@@ -200,6 +200,30 @@ class BitgetClient:
         out = (units * tick).quantize(Decimal(10) ** -place)
         return float(out)
 
+    # Absorbs binary float representation error before flooring. Without
+    # it, a value that is arithmetically one step (0.4 - 0.3 on a 0.1
+    # grid) arrives as 0.09999999999999998 and floors to zero steps.
+    _UNIT_EPS = Decimal("1e-9")
+
+    def size_step(self, symbol):
+        """Smallest tradeable size increment for the symbol."""
+        s = self.spec(symbol)
+        place = int(s["volumePlace"])
+        multiplier = Decimal(str(s.get("sizeMultiplier", "0") or "0"))
+        return multiplier if multiplier > 0 else (Decimal(10) ** -place)
+
+    def size_units(self, symbol, size):
+        """How many whole size-steps fit in `size`, as an int."""
+        step = self.size_step(symbol)
+        units = ((Decimal(str(size)) / step) + self._UNIT_EPS)
+        return int(units.to_integral_value(rounding=ROUND_DOWN))
+
+    def units_to_size(self, symbol, units):
+        """Turn a whole number of size-steps back into a float quantity."""
+        place = int(self.spec(symbol)["volumePlace"])
+        out = (Decimal(int(units)) * self.size_step(symbol))
+        return float(out.quantize(Decimal(10) ** -place))
+
     def round_size(self, symbol, size):
         """
         Quantise a position size DOWN onto the symbol's size grid.
@@ -209,12 +233,10 @@ class BitgetClient:
         s = self.spec(symbol)
         place = int(s["volumePlace"])
         min_qty = Decimal(str(s["minTradeNum"]))
-        multiplier = Decimal(str(s.get("sizeMultiplier", "0") or "0"))
 
-        step = multiplier if multiplier > 0 else (Decimal(10) ** -place)
-        q = Decimal(str(size))
-        units = (q / step).to_integral_value(rounding=ROUND_DOWN)
-        out = (units * step).quantize(Decimal(10) ** -place)
+        units = self.size_units(symbol, size)
+        out = (Decimal(units) * self.size_step(symbol)).quantize(
+            Decimal(10) ** -place)
 
         if out < min_qty:
             return 0.0
