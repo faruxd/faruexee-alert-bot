@@ -9,7 +9,7 @@
 #     • live trading, small size
 #     • 3 concurrent positions max, 2% risk each → 6% portfolio risk
 #     • resting limit orders at the zone edge
-#     • BTC / ETH / SOL / BNB / XRP on 1H and 4H
+#     • 11 crypto majors plus gold and silver, on 1H and 4H
 # =============================================================
 
 import os
@@ -74,8 +74,15 @@ MARGIN_COIN        = os.environ.get("BITGET_MARGIN_COIN", "USDT")
 #   TRADING SCOPE
 # =============================================================
 
+# Scan order is priority order: the loop stops once MAX_CONCURRENT is
+# reached, so symbols earlier in this list get first claim on a slot.
+# Majors first, then large alts, then metals.
+#
+# XAUUSDT is heavily size-constrained on a small account — its minimum
+# order (0.01 oz) is a large notional, so the 3x cap trims it to roughly
+# a third of the intended risk. It still trades, just smaller.
 SYMBOLS = [s.strip().upper() for s in os.environ.get(
-    "TRADE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+    "TRADE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,LINKUSDT,LTCUSDT,AVAXUSDT,ADAUSDT,SUIUSDT,NEARUSDT,XAUUSDT,XAGUSDT"
 ).split(",") if s.strip()]
 
 # 4H first so the higher timeframe wins when both fire on one symbol.
