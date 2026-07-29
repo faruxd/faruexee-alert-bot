@@ -793,6 +793,30 @@ class TradeBot:
         if distance > C.MAX_ENTRY_DISTANCE:
             return False
 
+        # Quantise the targets onto the tick grid too. The engine works in
+        # raw floats; without this the order record and the Discord message
+        # carry values like 73.71553663632267, and the stored TPs would not
+        # match what actually gets placed after the fill.
+        #
+        # Rounding is toward the entry — a target a tick nearer is a target
+        # that fills.
+        tp_mode = "down" if zone.side == "buy" else "up"
+        tp1 = self.client.round_price(symbol, zone.tp1, tp_mode)
+        tp2 = (self.client.round_price(symbol, zone.tp2, tp_mode)
+               if zone.tp2 is not None else None)
+        tp3 = (self.client.round_price(symbol, zone.tp3, tp_mode)
+               if zone.tp3 is not None else None)
+
+        # R:R must be re-checked against the prices actually being sent.
+        # Rounding moves entry, stop and target independently, so a setup
+        # sitting on the threshold can fall under it here.
+        sl_dist = abs(entry - sl)
+        rr = abs(tp1 - entry) / sl_dist if sl_dist > 0 else 0.0
+        if rr < C.MIN_RR:
+            log(f"  {symbol} {timeframe}: skipped — R:R {rr:.2f} below "
+                f"{C.MIN_RR} after tick rounding")
+            return False
+
         try:
             available = self._available()
         except BitgetError as e:
@@ -808,8 +832,8 @@ class TradeBot:
 
         oid = f"fx-{uuid.uuid4().hex[:20]}"
         log(f"ENTRY {symbol} {timeframe} {zone.side.upper()} "
-            f"size {size} @ {entry}  SL {sl}  TP1 {zone.tp1}  "
-            f"R:R {zone.rr:.2f}  risk {risk_usdt:.2f}")
+            f"size {size} @ {entry}  SL {sl}  TP1 {tp1}  "
+            f"R:R {rr:.2f}  risk {risk_usdt:.2f}")
 
         if self.live:
             try:
@@ -833,8 +857,8 @@ class TradeBot:
             "zone_id": zone.zone_id,
             "side": zone.side,
             "entry": entry, "sl": sl,
-            "tp1": zone.tp1, "tp2": zone.tp2, "tp3": zone.tp3,
-            "rr": zone.rr,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "rr": round(rr, 4),
             "size": size,
             "risk_usdt": risk_usdt,
             "placed_at": now_iso(),
@@ -844,9 +868,9 @@ class TradeBot:
             f"Timeframe: {timeframe}",
             f"Entry `{entry}`  ({distance:.2%} from `{price}`)",
             f"Stop `{sl}`   Size `{size}`   Risk `{risk_usdt:.2f}` {C.MARGIN_COIN}",
-            f"TP1 `{zone.tp1}`" + (f"  TP2 `{zone.tp2}`" if zone.tp2 else "")
-            + (f"  TP3 `{zone.tp3}`" if zone.tp3 else ""),
-            f"R:R {zone.rr:.2f}   Slot {self.slots_used()}/{C.MAX_CONCURRENT}",
+            f"TP1 `{tp1}`" + (f"  TP2 `{tp2}`" if tp2 else "")
+            + (f"  TP3 `{tp3}`" if tp3 else ""),
+            f"R:R {rr:.2f}   Slot {self.slots_used()}/{C.MAX_CONCURRENT}",
         ], GREEN if zone.side == "buy" else RED)
         return True
 
