@@ -1,34 +1,54 @@
 # =============================================================
-#   RENDER BLUEPRINT  —  FARUEXEE Trade Bot
+#   RENDER BLUEPRINT  —  FARUEXEE Trade Bot  (free Web Service)
 # =============================================================
 #
-#   Every secret below is marked `sync: false`. Render will NOT read
-#   those values from this file — it prompts you for them in the
-#   dashboard instead. Nothing sensitive belongs in this repo.
+#   Blueprints themselves are free. This one defines a free Web
+#   Service, the same shape as your Discord alert bot.
+#
+#   Every secret is `sync: false` — Render prompts for those in the
+#   dashboard and never reads them from this file. Nothing sensitive
+#   belongs in this repo.
 #
 #   Deploy:  Render Dashboard -> New -> Blueprint -> pick this repo
+#            (or "Connect a new Blueprint" if you are on the
+#             Blueprints page — skip any "download generated
+#             render.yaml" step, this file is the one you want)
 #
-#   Default here is a Background Worker with a persistent disk, which
-#   is the correct shape for a trading bot: it never sleeps and its
-#   state survives restarts. See TRADING_README.md for the free-tier
-#   Web Service alternative and what you give up.
+#   ── What the free tier costs you ────────────────────────────
+#
+#   1. It sleeps after ~15 minutes without inbound HTTP traffic.
+#      A sleeping bot manages nothing. Point an uptime pinger at
+#      /health every 10 minutes. That endpoint also returns 503 if
+#      the trading loop stalls, so the pinger doubles as a watchdog.
+#
+#   2. No persistent disk. trade_journal.csv is wiped on restart.
+#      Mitigated: every position close is posted to Discord as a
+#      full journal row, so the record survives in your channel.
+#
+#      The daily-loss stop is NOT affected — it reads today's
+#      realised PnL from Bitget's position history, so a wiped
+#      state file cannot silently disable it.
+#
+#   Open positions are never at risk from any of this: stops and
+#   take-profits live on the exchange, and startup reconciles
+#   against it.
+#
+#   To move to a worker with a real disk later, change type to
+#   `worker`, set `plan: starter`, add a disk mounted at /var/data,
+#   and set DATA_DIR=/var/data.
 # =============================================================
 
 services:
-  - type: worker
+  - type: web
     name: faruexee-trade-bot
     runtime: python
-    plan: starter                 # workers have no free tier
-    region: oregon                # move closer to Bitget if latency matters
+    plan: free
+    region: oregon                # same region as your alert bot
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python faruexee_trade_bot.py
-    autoDeploy: false             # never redeploy a live trading bot on a push
-
-    disk:
-      name: faruexee-data
-      mountPath: /var/data
-      sizeGB: 1
+    healthCheckPath: /health
+    autoDeploy: false             # never redeploy a live bot on a git push
 
     envVars:
       # ── Secrets — entered in the Render dashboard, never in git ──
@@ -41,16 +61,18 @@ services:
       - key: DISCORD_WEBHOOK
         sync: false
 
-      # ── Persistence ──
-      - key: DATA_DIR
-        value: /var/data
-
       # ── Master switches ──
       # Deploy with these OFF. Watch a dry run, then flip both in the
       # dashboard and restart. Do not commit them as true.
       - key: LIVE_TRADING
         value: "false"
       - key: DRY_RUN
+        value: "true"
+
+      # Free tier has no disk. The warning banner at startup is
+      # expected — set this false once you have read it and accepted
+      # the tradeoff above.
+      - key: WARN_EPHEMERAL
         value: "true"
 
       # ── Scope ──

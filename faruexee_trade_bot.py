@@ -357,6 +357,41 @@ class TradeBot:
     def zone_already_ordered(self, zone_id):
         return any(o["zone_id"] == zone_id for o in self.state["orders"].values())
 
+    def _utc_midnight_ms(self):
+        now = datetime.now(timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(midnight.timestamp() * 1000)
+
+    def _exchange_daily_drawdown(self):
+        """
+        Today's realised loss as a fraction of equity, read from Bitget's
+        position history rather than the local state file.
+
+        Without this the daily stop measures from a baseline stored on
+        disk — so on an ephemeral host every restart resets it and the
+        limit silently stops existing. This path survives restarts because
+        the exchange remembers what the bot forgot.
+
+        Returns None when unavailable; callers fall back to the local
+        baseline rather than treating unknown as safe.
+        """
+        if self.offline:
+            return None
+        try:
+            realized = self.client.get_realized_pnl_since(self._utc_midnight_ms())
+        except BitgetError as e:
+            log(f"[WARN] realised PnL lookup failed: {e}")
+            return None
+
+        if realized >= 0:
+            return 0.0
+        # Equity already reflects the loss, so today's opening equity was
+        # roughly equity - realized (realized being negative here).
+        opening = self.equity - realized
+        if opening <= 0:
+            return None
+        return (-realized) / opening
+
     def check_breakers(self):
         """Returns True when trading may continue."""
         daily = self.state["daily"]
@@ -372,7 +407,16 @@ class TradeBot:
             daily = self.state["daily"]
 
         start = daily.get("start_equity") or self.equity
-        drawdown = (start - self.equity) / start if start > 0 else 0.0
+        local_dd = (start - self.equity) / start if start > 0 else 0.0
+
+        # Take the worse of the local baseline and the exchange's own
+        # record of today's realised losses. The local number can be
+        # reset by a restart; the exchange number cannot.
+        exch_dd = self._exchange_daily_drawdown()
+        drawdown = local_dd if exch_dd is None else max(local_dd, exch_dd)
+        if exch_dd is not None and exch_dd > local_dd + 0.005:
+            log(f"Daily drawdown from exchange history: {exch_dd:.2%} "
+                f"(local baseline said {local_dd:.2%})")
 
         if drawdown >= C.MAX_DAILY_LOSS and not self.state["halted"]:
             self.state["halted"] = True
@@ -634,10 +678,44 @@ class TradeBot:
         })
 
         log(f"{sym}: position closed ({outcome}) net {net_pnl}")
-        notify(f"Position closed — {sym}", [
+
+        # This message is a complete journal row on purpose. On a host with
+        # an ephemeral filesystem the CSV is wiped on every restart, so the
+        # Discord channel becomes the durable record of what actually
+        # happened — which is the only way to learn whether the strategy
+        # has an edge.
+        held = ""
+        try:
+            opened = datetime.fromisoformat(pos.get("opened_at", ""))
+            hours = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+            held = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+        except (TypeError, ValueError):
+            pass
+
+        risk = pos.get("risk_usdt")
+        r_multiple = ""
+        try:
+            if net_pnl != "" and risk:
+                r_multiple = f"  ({float(net_pnl) / float(risk):+.2f}R)"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+        tps = " / ".join(
+            str(pos.get(k)) for k in ("tp1", "tp2", "tp3") if pos.get(k) is not None
+        )
+
+        notify(f"Position closed — {sym} {str(pos.get('side', '')).upper()}", [
             f"Outcome: **{outcome}**",
-            f"Net PnL: `{net_pnl}` {C.MARGIN_COIN}" if net_pnl != "" else "Net PnL: unavailable",
-            f"Entry `{pos.get('entry')}`  Stop `{pos.get('sl')}`",
+            (f"Net PnL: `{net_pnl}` {C.MARGIN_COIN}{r_multiple}"
+             if net_pnl != "" else "Net PnL: unavailable"),
+            "",
+            f"Timeframe `{pos.get('timeframe')}`   Held `{held or 'n/a'}`",
+            f"Entry `{pos.get('entry')}`   Stop `{pos.get('sl')}`"
+            + ("  (moved to BE)" if pos.get("be_moved") else ""),
+            f"Targets `{tps or 'n/a'}`",
+            f"Size `{pos.get('orig_size')}`   Risked `{risk}` {C.MARGIN_COIN}"
+            f"   Planned R:R `{pos.get('rr')}`",
+            f"Opened `{pos.get('opened_at', '')[:19]}`",
         ], GREEN if outcome == "win" else RED if outcome == "loss" else ORANGE)
 
     # ---------------------------------------------------------

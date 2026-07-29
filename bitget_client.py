@@ -299,10 +299,13 @@ class BitgetClient:
                 return p
         return None
 
-    def get_position_history(self, symbol=None, limit=20):
+    def get_position_history(self, symbol=None, limit=20,
+                             start_time=None, end_time=None):
         """
         Closed positions, newest first. Used by the journal to record the
         real net PnL of a trade rather than guessing from equity deltas.
+
+        start_time / end_time are epoch milliseconds.
         """
         data = self._request(
             "GET", "/api/v2/mix/position/history-position",
@@ -310,11 +313,36 @@ class BitgetClient:
                 "symbol": symbol,
                 "productType": self.product_type,
                 "limit": limit,
+                "startTime": start_time,
+                "endTime": end_time,
             },
         )
         if isinstance(data, dict):
             return data.get("list") or []
         return data or []
+
+    def get_realized_pnl_since(self, start_time_ms):
+        """
+        Net realised PnL from every position closed since start_time_ms.
+
+        This is read straight from the exchange, so it survives the bot
+        losing its local state — which is what makes the daily-loss stop
+        durable on hosts with an ephemeral filesystem.
+        """
+        total = 0.0
+        try:
+            rows = self.get_position_history(limit=100, start_time=start_time_ms)
+        except BitgetError:
+            raise
+        for r in rows:
+            for key in ("netProfit", "pnl", "achievedProfits"):
+                if r.get(key) not in (None, ""):
+                    try:
+                        total += float(r[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        return total
 
     def get_pending_orders(self, symbol=None):
         data = self._request(

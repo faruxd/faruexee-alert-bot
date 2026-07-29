@@ -46,24 +46,38 @@ git push origin main
 
 ## Step 2 — Create the service
 
-In Render: **New → Blueprint**, pick your repo. Render reads `render.yaml` and creates a
-**Background Worker** named `faruexee-trade-bot` with a 1 GB persistent disk at `/var/data`.
+In Render: **New → Blueprint**, pick your repo, Apply. Blueprints are free to use.
 
-Worker rather than Web Service, deliberately:
+Render reads `render.yaml` and creates a **free Web Service** named `faruexee-trade-bot`,
+the same shape as your Discord alert bot, with all 44 settings applied and only the four
+secrets left blank.
 
-| | Background Worker | Free Web Service |
-|---|---|---|
-| Sleeps when idle | Never | After 15 min |
-| Persistent disk | Yes | Not on free tier |
-| Cost | ~$7/mo + ~$0.25 disk | Free |
+If you are already on the Blueprints page and see a screen offering to **download a
+generated render.yaml**, skip that — it exports your *existing* services and would
+overwrite this file. Use **Connect a new Blueprint** instead.
 
-A trading bot that falls asleep stops managing positions — no break-even moves, no stale
-order cleanup, no daily-loss tracking. Your stops stay live on Bitget either way, but the
-bot's own risk controls go with it. For real money the worker is the right call.
+### Two things the free tier costs you
 
-**If you want the free tier anyway:** in `render.yaml` change `type: worker` to
-`type: web`, delete the `disk:` block, and add `ENABLE_WEB=true`. You lose persistence —
-read the "Ephemeral storage" section below so you know exactly what that costs you.
+**1. It sleeps after ~15 minutes without inbound traffic.** A sleeping bot manages
+nothing. Fix it with an uptime pinger — see step 7.
+
+**2. No persistent disk, so `trade_journal.csv` is wiped on restart.** Mitigated: every
+position close is posted to Discord as a complete journal row — timeframe, entry, stop,
+targets, size, risk, hold time, net PnL and R multiple. Your Discord channel becomes the
+durable record. Export it later if you want the numbers in a spreadsheet.
+
+**The daily-loss stop is not affected.** It reads today's realised PnL directly from
+Bitget's position history, so a wiped state file cannot silently switch it off. The
+exchange remembers what the bot forgets.
+
+Open positions are never at risk from any of this — stops and take-profits live on the
+exchange, and startup reconciles against it.
+
+### Upgrading later
+
+When you want a worker with a real disk, change `render.yaml` to `type: worker`,
+`plan: starter`, add a disk at `/var/data`, and set `DATA_DIR=/var/data`. Roughly
+$7.25/month, and the journal becomes a real file again.
 
 ---
 
@@ -102,6 +116,22 @@ your logs, or this conversation — I have not seen them and do not need to.
 - **Withdraw** — must be OFF, the bot never needs it and it caps the damage if the key leaks
 - **IP whitelist** — bind it to your Render outbound IPs (Settings → Outbound IP Addresses).
   Strongly recommended: a leaked key that only works from one IP is close to worthless.
+
+---
+
+## Step 7 — Keep it awake (free tier only)
+
+A free Web Service sleeps after ~15 minutes without inbound HTTP traffic, and a sleeping
+bot stops managing positions.
+
+1. Copy your service URL from the Render dashboard, e.g.
+   `https://faruexee-trade-bot.onrender.com`
+2. Create a free monitor at [uptimerobot.com](https://uptimerobot.com) (or any pinger)
+3. Type: HTTP(s). URL: `https://your-service.onrender.com/health`. Interval: 5 minutes.
+
+`/health` returns 503 once the trading loop has been stalled for 15 minutes, so the
+pinger doubles as a watchdog — set it to alert you on failure and you will hear about a
+dead bot instead of discovering it later.
 
 ---
 
