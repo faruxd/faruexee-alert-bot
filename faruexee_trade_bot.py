@@ -79,14 +79,24 @@ def engine_config():
 #   DISCORD
 # =============================================================
 
+# Set once by TradeBot.__init__. Every Discord message is tagged with the
+# mode, because a message reading "Limit order placed" when nothing was
+# sent to the exchange is worse than no message at all.
+_LIVE_MODE = False
+
+
 def notify(title, lines, color=0x2F3136):
     if not C.DISCORD_WEBHOOK:
         return
+    if not _LIVE_MODE:
+        title = f"[DRY RUN] {title}"
+        lines = list(lines) + ["", "_Simulated — nothing was sent to Bitget._"]
     embed = {
         "title": title,
         "description": "\n".join(lines),
         "color": color,
-        "footer": {"text": "FARUEXEE Trade Bot"},
+        "footer": {"text": "FARUEXEE Trade Bot"
+                           + ("" if _LIVE_MODE else "  •  DRY RUN")},
         "timestamp": now_iso(),
     }
     try:
@@ -110,8 +120,10 @@ class TradeBot:
             C.BITGET_API_KEY, C.BITGET_API_SECRET, C.BITGET_PASSPHRASE,
             product_type=C.PRODUCT_TYPE, margin_coin=C.MARGIN_COIN,
         )
+        global _LIVE_MODE
         self.state = self._load_state()
         self.live = C.LIVE_TRADING and not C.DRY_RUN
+        _LIVE_MODE = self.live
         # Offline = dry run with no credentials. Public market data still
         # flows; account state is simulated so the bot can be exercised
         # end to end before an API key exists.
@@ -864,7 +876,8 @@ class TradeBot:
             "placed_at": now_iso(),
         }
 
-        notify(f"Limit order placed — {symbol} {zone.side.upper()}", [
+        notify(f"{'Limit order placed' if self.live else 'Limit order simulated'}"
+               f" — {symbol} {zone.side.upper()}", [
             f"Timeframe: {timeframe}",
             f"Entry `{entry}`  ({distance:.2%} from `{price}`)",
             f"Stop `{sl}`   Size `{size}`   Risk `{risk_usdt:.2f}` {C.MARGIN_COIN}",
