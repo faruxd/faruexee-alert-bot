@@ -44,17 +44,48 @@ git push origin main
 
 ---
 
-## Step 2 — Create the service
+## Step 2 — Create the service (free, no card)
 
-In Render: **New → Blueprint**, pick your repo, Apply. Blueprints are free to use.
+**Do not use the Blueprint flow.** Render requires payment information on file for any
+Blueprint deployment, whatever instance type the file asks for. `render.yaml` is kept in
+the repo for when you upgrade later, but it cannot deploy on a free account.
 
-Render reads `render.yaml` and creates a **free Web Service** named `faruexee-trade-bot`,
-the same shape as your Discord alert bot, with all 44 settings applied and only the four
-secrets left blank.
+Use **New → Web Service** instead:
 
-If you are already on the Blueprints page and see a screen offering to **download a
-generated render.yaml**, skip that — it exports your *existing* services and would
-overwrite this file. Use **Connect a new Blueprint** instead.
+| Field | Value |
+|---|---|
+| Source Code | `faruxd/faruexee-alert-bot` |
+| Name | `faruexee-trade-bot` |
+| Language | Python 3 |
+| Branch | `main` |
+| Region | Oregon (same as your alert bot) |
+| Root Directory | leave blank |
+| Build Command | `pip install -r requirements.txt` |
+| **Start Command** | **`python faruexee_trade_bot.py`** |
+| Instance Type | **Free** |
+
+Render autodetects Flask and pre-fills the start command as
+`gunicorn your_application.wsgi`. **That is wrong and must be replaced** — it would serve
+a web page instead of running the bot.
+
+Then under **Environment Variables**, click **Add from .env** and paste the block from
+step 4 below.
+
+### Two things the free tier costs you
+
+**1. It sleeps after ~15 minutes without inbound traffic.** A sleeping bot manages
+nothing. Fix it with an uptime pinger — see step 7.
+
+**2. No persistent disk, so `trade_journal.csv` is wiped on restart.** Mitigated: every
+position close is posted to Discord as a complete journal row — timeframe, entry, stop,
+targets, size, risk, hold time, net PnL and R multiple. Your Discord channel becomes the
+durable record.
+
+**The daily-loss stop is not affected.** It reads today's realised PnL directly from
+Bitget's position history, so a wiped state file cannot silently switch it off.
+
+Open positions are never at risk from any of this — stops and take-profits live on the
+exchange, and startup reconciles against it.
 
 ### Two things the free tier costs you
 
@@ -88,24 +119,64 @@ covers the `float | None` syntax the engine uses. Nothing to do unless you remov
 
 ---
 
-## Step 4 — Paste your API keys
+## Step 4 — Environment variables and API keys
 
-This is the part you asked about.
+On the service creation screen, under **Environment Variables**, click **Add from .env**
+and paste this whole block. Fill in the top four with your own values first.
 
-1. Open your service in the Render dashboard
-2. Left sidebar → **Environment**
-3. You will see `BITGET_API_KEY`, `BITGET_API_SECRET`, `BITGET_PASSPHRASE` and
-   `DISCORD_WEBHOOK` listed **with empty values** — that is `sync: false` doing its job.
-   Render knows they exist but refuses to take values from the repo.
-4. Click the pencil / **Edit** next to each and paste the value
-5. Click **Save Changes**
+```
+BITGET_API_KEY=
+BITGET_API_SECRET=
+BITGET_PASSPHRASE=
+DISCORD_WEBHOOK=
+LIVE_TRADING=false
+DRY_RUN=true
+WARN_EPHEMERAL=true
+TRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
+TRADE_TIMEFRAMES=4H,1H
+CHECK_INTERVAL=120
+RISK_PER_TRADE=0.02
+MAX_CONCURRENT=3
+MAX_PORTFOLIO_RISK=0.06
+MAX_DAILY_LOSS=0.06
+MIN_EQUITY_FRACTION=0.70
+MIN_EQUITY_USDT=50
+LEVERAGE=10
+MARGIN_MODE=isolated
+MAX_NOTIONAL_X_EQUITY=3.0
+MAX_MARGIN_FRACTION=0.30
+MAX_ENTRY_DISTANCE=0.05
+ORDER_FORCE=gtc
+ORDER_TTL_HOURS=48
+TP1_SPLIT=0.50
+TP2_SPLIT=0.30
+TP3_SPLIT=0.20
+MOVE_SL_TO_BE=true
+BE_OFFSET_R=0.05
+TRIGGER_TYPE=mark_price
+LOOKBACK=20
+IMPULSE_STRENGTH=1.5
+TREND_STABILITY=2
+VOLUME_MULT=1.5
+REQUIRE_VOLUME=true
+USE_BASE_CANDLE=true
+USE_ATR_SL=true
+ATR_LEN=14
+ATR_MULT=0.5
+MIN_RR=1.5
+TP_MULTI=2.0
+ZONE_MAX_AGE=300
+BREACH_BUF_MULT=0.1
+FVG_RECENT_BARS=100
+REQUIRE_HTF=true
+HTF_BIAS_MODE=ema
+HTF_EMA_LEN=50
+HTF_FLAT_BLOCKS=false
+PYTHON_VERSION=3.12.7
+```
 
-| Variable | Value |
-|---|---|
-| `BITGET_API_KEY` | your API key |
-| `BITGET_API_SECRET` | your secret key |
-| `BITGET_PASSPHRASE` | the passphrase you set when creating the key |
-| `DISCORD_WEBHOOK` | your webhook URL |
+`ENABLE_WEB` and `PORT` are not listed because Render sets `PORT` automatically for web
+services and the bot detects it, binding the health server on its own.
 
 Render stores these encrypted and injects them at runtime. They never touch your repo,
 your logs, or this conversation — I have not seen them and do not need to.
@@ -114,24 +185,14 @@ your logs, or this conversation — I have not seen them and do not need to.
 
 - **Trade** — must be ON, the bot cannot place orders without it
 - **Withdraw** — must be OFF, the bot never needs it and it caps the damage if the key leaks
+- **IP whitelist** — bind it to your Render outbound IPs (Settings → Outbound IP Addresses)
+
+**Check your Bitget key permissions before saving:**
+
+- **Trade** — must be ON, the bot cannot place orders without it
+- **Withdraw** — must be OFF, the bot never needs it and it caps the damage if the key leaks
 - **IP whitelist** — bind it to your Render outbound IPs (Settings → Outbound IP Addresses).
   Strongly recommended: a leaked key that only works from one IP is close to worthless.
-
----
-
-## Step 7 — Keep it awake (free tier only)
-
-A free Web Service sleeps after ~15 minutes without inbound HTTP traffic, and a sleeping
-bot stops managing positions.
-
-1. Copy your service URL from the Render dashboard, e.g.
-   `https://faruexee-trade-bot.onrender.com`
-2. Create a free monitor at [uptimerobot.com](https://uptimerobot.com) (or any pinger)
-3. Type: HTTP(s). URL: `https://your-service.onrender.com/health`. Interval: 5 minutes.
-
-`/health` returns 503 once the trading loop has been stalled for 15 minutes, so the
-pinger doubles as a watchdog — set it to alert you on failure and you will hear about a
-dead bot instead of discovering it later.
 
 ---
 
@@ -170,6 +231,22 @@ first live cycle, and Discord gets a "Trade bot started" message with mode `LIVE
 
 `autoDeploy: false` is set on purpose — a git push will not silently redeploy a bot that
 is holding positions. Deploy manually when you choose to.
+
+---
+
+## Step 7 — Keep it awake (required on free tier)
+
+A free Web Service sleeps after ~15 minutes without inbound HTTP traffic, and a sleeping
+bot stops managing positions.
+
+1. Copy your service URL from the Render dashboard, e.g.
+   `https://faruexee-trade-bot.onrender.com`
+2. Create a free monitor at [uptimerobot.com](https://uptimerobot.com) (or any pinger)
+3. Type: HTTP(s). URL: `https://your-service.onrender.com/health`. Interval: 5 minutes.
+
+`/health` returns 503 once the trading loop has been stalled for 15 minutes, so the
+pinger doubles as a watchdog — set it to alert you on failure and you will hear about a
+dead bot instead of discovering it later.
 
 ---
 
