@@ -1,0 +1,149 @@
+# =============================================================
+#   RENDER BLUEPRINT  —  FARUEXEE Trade Bot
+# =============================================================
+#
+#   Every secret below is marked `sync: false`. Render will NOT read
+#   those values from this file — it prompts you for them in the
+#   dashboard instead. Nothing sensitive belongs in this repo.
+#
+#   Deploy:  Render Dashboard -> New -> Blueprint -> pick this repo
+#
+#   Default here is a Background Worker with a persistent disk, which
+#   is the correct shape for a trading bot: it never sleeps and its
+#   state survives restarts. See TRADING_README.md for the free-tier
+#   Web Service alternative and what you give up.
+# =============================================================
+
+services:
+  - type: worker
+    name: faruexee-trade-bot
+    runtime: python
+    plan: starter                 # workers have no free tier
+    region: oregon                # move closer to Bitget if latency matters
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python faruexee_trade_bot.py
+    autoDeploy: false             # never redeploy a live trading bot on a push
+
+    disk:
+      name: faruexee-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      # ── Secrets — entered in the Render dashboard, never in git ──
+      - key: BITGET_API_KEY
+        sync: false
+      - key: BITGET_API_SECRET
+        sync: false
+      - key: BITGET_PASSPHRASE
+        sync: false
+      - key: DISCORD_WEBHOOK
+        sync: false
+
+      # ── Persistence ──
+      - key: DATA_DIR
+        value: /var/data
+
+      # ── Master switches ──
+      # Deploy with these OFF. Watch a dry run, then flip both in the
+      # dashboard and restart. Do not commit them as true.
+      - key: LIVE_TRADING
+        value: "false"
+      - key: DRY_RUN
+        value: "true"
+
+      # ── Scope ──
+      - key: TRADE_SYMBOLS
+        value: BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
+      - key: TRADE_TIMEFRAMES
+        value: 4H,1H
+      - key: CHECK_INTERVAL
+        value: "120"
+
+      # ── Risk ──
+      - key: RISK_PER_TRADE
+        value: "0.02"
+      - key: MAX_CONCURRENT
+        value: "3"
+      - key: MAX_PORTFOLIO_RISK
+        value: "0.06"
+      - key: MAX_DAILY_LOSS
+        value: "0.06"
+      - key: MIN_EQUITY_FRACTION
+        value: "0.70"
+      - key: MIN_EQUITY_USDT
+        value: "50"
+      - key: LEVERAGE
+        value: "10"
+      - key: MARGIN_MODE
+        value: isolated
+      - key: MAX_NOTIONAL_X_EQUITY
+        value: "3.0"
+      - key: MAX_MARGIN_FRACTION
+        value: "0.30"
+      - key: MAX_ENTRY_DISTANCE
+        value: "0.05"
+
+      # ── Order lifecycle ──
+      - key: ORDER_FORCE
+        value: gtc
+      - key: ORDER_TTL_HOURS
+        value: "48"
+      - key: TP1_SPLIT
+        value: "0.50"
+      - key: TP2_SPLIT
+        value: "0.30"
+      - key: TP3_SPLIT
+        value: "0.20"
+      - key: MOVE_SL_TO_BE
+        value: "true"
+      - key: BE_OFFSET_R
+        value: "0.05"
+      - key: TRIGGER_TYPE
+        value: mark_price
+
+      # ── Strategy ──
+      - key: LOOKBACK
+        value: "20"
+      - key: IMPULSE_STRENGTH
+        value: "1.5"
+      - key: TREND_STABILITY
+        value: "2"
+      - key: VOLUME_MULT
+        value: "1.5"
+      - key: REQUIRE_VOLUME
+        value: "true"
+      - key: USE_BASE_CANDLE
+        value: "true"
+      - key: USE_ATR_SL
+        value: "true"
+      - key: ATR_LEN
+        value: "14"
+      - key: ATR_MULT
+        value: "0.5"
+      - key: MIN_RR
+        value: "1.5"
+      - key: TP_MULTI
+        value: "2.0"
+      - key: ZONE_MAX_AGE
+        value: "300"
+      - key: BREACH_BUF_MULT
+        value: "0.1"
+      - key: FVG_RECENT_BARS
+        value: "100"
+
+      # Keep this on "ema". "structure" cannot resolve on the daily —
+      # Bitget serves only 90 daily candles — and would block every 4H
+      # entry permanently.
+      - key: REQUIRE_HTF
+        value: "true"
+      - key: HTF_BIAS_MODE
+        value: ema
+      - key: HTF_EMA_LEN
+        value: "50"
+      - key: HTF_FLAT_BLOCKS
+        value: "false"
+
+      - key: PYTHON_VERSION
+        value: "3.12.7"

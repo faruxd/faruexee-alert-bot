@@ -1,0 +1,167 @@
+// ============================================================
+// FARUEXEE Strategy Backtester  —  Potential Entry Zones Only
+// Win definition: TP1 hit BEFORE SL  |  Limit-fill entries
+// Pine Script v6  |  Run on TradingView Strategy Tester
+// ============================================================
+//@version=6
+strategy("FARUEXEE Backtest [Potential Entries]",
+     overlay              = true,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 10,
+     pyramiding           = 10,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.05,
+     process_orders_on_close = false,
+     calc_on_every_tick   = false,
+     max_boxes_count      = 500,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ── Inputs ──
+lookback        = input.int(20,  "Swing Lookback",                minval=5, maxval=100)
+impulseStrength = input.float(1.5,"Impulse Strength (× avg body)",minval=1.0, step=0.1)
+slBuffer        = input.float(0.1,"SL Buffer (× zone height)",    minval=0.0, step=0.05)
+tpMulti         = input.float(2.0,"TP Fallback Multiplier",       minval=0.5, step=0.5)
+maxZoneAgeBars  = input.int(500, "Cancel limit if not filled in N bars", minval=10)
+showZones       = input.bool(true,"Plot zones for visual check")
+
+// ── Pivots & trend ──
+swingH = ta.pivothigh(high, lookback, lookback)
+swingL = ta.pivotlow (low,  lookback, lookback)
+var float ph1=na, var float ph2=na, var float pl1=na, var float pl2=na
+if not na(swingH)
+    ph2 := ph1
+    ph1 := swingH
+if not na(swingL)
+    pl2 := pl1
+    pl1 := swingL
+isHH = not na(swingH) and not na(ph2) and swingH > ph2
+isLH = not na(swingH) and not na(ph2) and swingH < ph2
+isHL = not na(swingL) and not na(pl2) and swingL > pl2
+isLL = not na(swingL) and not na(pl2) and swingL < pl2
+var int trend = 0
+if isHH or isHL
+    trend := 1
+if isLH or isLL
+    trend := -1
+
+// ── Impulse + gap ──
+float avgBody     = ta.sma(math.abs(close - open), 20)
+bool  bullImpulse = close > open and (close - open) >= avgBody * impulseStrength
+bool  bearImpulse = close < open and (open - close) >= avgBody * impulseStrength
+bool  bullGap     = low  > high[2]
+bool  bearGap     = high < low[2]
+
+// ── Zone storage (potential entry only — gap-confirmed) ──
+var float[] dTop = array.new<float>()
+var float[] dBot = array.new<float>()
+var int[]   dBar = array.new<int>()
+var float[] sTop = array.new<float>()
+var float[] sBot = array.new<float>()
+var int[]   sBar = array.new<int>()
+
+// SL helpers
+calcLongSL(zT, zB)  => zB - (zT - zB) * slBuffer
+calcShortSL(zT, zB) => zT + (zT - zB) * slBuffer
+
+// ── Find TP1 (next opposing zone, else fallback RR) ──
+findLongTP1(entry, sl) =>
+    float best = na
+    if array.size(sTop) > 0
+        for k = 0 to array.size(sTop) - 1
+            float zb = array.get(sBot, k)
+            if zb > entry and (na(best) or zb < best)
+                best := zb
+    na(best) ? entry + (entry - sl) * tpMulti : best
+
+findShortTP1(entry, sl) =>
+    float best = na
+    if array.size(dTop) > 0
+        for k = 0 to array.size(dTop) - 1
+            float zt = array.get(dTop, k)
+            if zt < entry and (na(best) or zt > best)
+                best := zt
+    na(best) ? entry - (sl - entry) * tpMulti : best
+
+// ── Create zones on impulse + gap ──
+if bullImpulse and bullGap and trend == 1
+    float zT = high[1]
+    float zB = low[1]
+    if zT > zB
+        array.push(dTop, zT)
+        array.push(dBot, zB)
+        array.push(dBar, bar_index)
+        if showZones
+            box.new(bar_index[1], zT, bar_index + 50, zB,
+                 bgcolor=color.new(color.green, 80),
+                 border_color=color.new(color.lime, 30))
+
+if bearImpulse and bearGap and trend == -1
+    float zT = high[1]
+    float zB = low[1]
+    if zT > zB
+        array.push(sTop, zT)
+        array.push(sBot, zB)
+        array.push(sBar, bar_index)
+        if showZones
+            box.new(bar_index[1], zT, bar_index + 50, zB,
+                 bgcolor=color.new(color.red, 80),
+                 border_color=color.new(color.red, 30))
+
+// ══════════════════════════════════════════════
+//  LIMIT-FILL TRADE EXECUTION
+//  Each zone = one trade attempt: limit @ zone edge,
+//  SL beyond zone, TP1 = next opposing zone (or RR fallback).
+//  Trade is recorded when low/high taps the zone.
+// ══════════════════════════════════════════════
+
+// ── Long zone taps ──
+if array.size(dTop) > 0
+    int i = array.size(dTop) - 1
+    while i >= 0
+        float zT  = array.get(dTop, i)
+        float zB  = array.get(dBot, i)
+        int   bar = array.get(dBar, i)
+        bool tooOld = bar_index - bar > maxZoneAgeBars
+        bool tap    = bar_index > bar and low <= zT and high >= zB
+        if tap
+            float entry = zT
+            float sl    = calcLongSL(zT, zB)
+            float tp1   = findLongTP1(entry, sl)
+            string id   = "L_" + str.tostring(bar)
+            strategy.entry(id, strategy.long, limit=entry)
+            strategy.exit("X_" + id, from_entry=id, stop=sl, limit=tp1)
+            array.remove(dTop, i)
+            array.remove(dBot, i)
+            array.remove(dBar, i)
+        else if tooOld
+            array.remove(dTop, i)
+            array.remove(dBot, i)
+            array.remove(dBar, i)
+        i -= 1
+
+// ── Short zone taps ──
+if array.size(sTop) > 0
+    int i = array.size(sTop) - 1
+    while i >= 0
+        float zT  = array.get(sTop, i)
+        float zB  = array.get(sBot, i)
+        int   bar = array.get(sBar, i)
+        bool tooOld = bar_index - bar > maxZoneAgeBars
+        bool tap    = bar_index > bar and high >= zB and low <= zT
+        if tap
+            float entry = zB
+            float sl    = calcShortSL(zT, zB)
+            float tp1   = findShortTP1(entry, sl)
+            string id   = "S_" + str.tostring(bar)
+            strategy.entry(id, strategy.short, limit=entry)
+            strategy.exit("X_" + id, from_entry=id, stop=sl, limit=tp1)
+            array.remove(sTop, i)
+            array.remove(sBot, i)
+            array.remove(sBar, i)
+        else if tooOld
+            array.remove(sTop, i)
+            array.remove(sBot, i)
+            array.remove(sBar, i)
+        i -= 1

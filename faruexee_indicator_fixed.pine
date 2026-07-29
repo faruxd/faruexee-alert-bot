@@ -1,0 +1,1124 @@
+// ============================================================
+// FARUEXEE Strategy Indicator — FIXED (A–J applied)
+// Pine Script v6  |  Tuned for 1H / 4H  |  Pure Price Action
+// ============================================================
+//@version=6
+indicator("FARUEXEE Strategy [Fixed]",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500)
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Market Structure
+// ══════════════════════════════════════════════
+grpStruct      = "── Market Structure ──"
+lookback       = input.int(20, "Swing Lookback (bars)", minval=5, maxval=100, group=grpStruct,
+     tooltip="• 1H chart → 15–20\n• 4H chart → 10–15")
+showStructure  = input.bool(true, "Show HH / HL / LH / LL", group=grpStruct)
+trendStability = input.int(2, "Trend Flip Stability (opposing pivots needed)", minval=1, maxval=5, group=grpStruct,
+     tooltip="Fix H: require N opposing pivots in a row before flipping trend.")
+
+// ══════════════════════════════════════════════
+//  SETTINGS — HTF Bias (Fix F)
+// ══════════════════════════════════════════════
+grpHTF        = "── HTF Bias Filter ──"
+useHTF        = input.bool(true,  "Require HTF trend agreement", group=grpHTF)
+htfTimeframe  = input.timeframe("240", "HTF Timeframe", group=grpHTF,
+     tooltip="On 1H chart → use 240 (4H). On 4H chart → use D.")
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Zones
+// ══════════════════════════════════════════════
+grpZones            = "── Supply & Demand Zones ──"
+showZones           = input.bool(true,  "Show Zones",                         group=grpZones)
+showTestedPotential = input.bool(true,  "Show Tested ★ Zones (Fix G needs this on)", group=grpZones,
+     tooltip="Fix G: zones survive first tap and can fire on second test.")
+showTestedRegular   = input.bool(false, "Show Tested Regular Zones",          group=grpZones)
+rightExtend         = input.int(50,     "Extend Zones Right (bars)",          minval=10, maxval=300, group=grpZones)
+impulseStrength     = input.float(1.5,  "Impulse Strength (× avg body)",      minval=1.0, step=0.1, group=grpZones)
+useBaseCandle       = input.bool(true,  "Use Base Candle as Zone (Fix I)",    group=grpZones,
+     tooltip="If true, zone = last opposite-color candle before the impulse (origin block).\nIf false, zone = the impulse candle range.")
+requireVolume       = input.bool(true,  "Require Volume Confirmation (Fix J)", group=grpZones)
+volumeMult          = input.float(1.5,  "Volume Multiplier (× 20-bar avg)",   minval=1.0, step=0.1, group=grpZones)
+fireOnSecondTest    = input.bool(true,  "Fire on 2nd Test, not 1st (Fix G)",  group=grpZones,
+     tooltip="Classic SD: 2nd touch is statistically the strongest. 1st touch is often a stop hunt.")
+demandCol           = input.color(color.new(color.green, 75), "Demand Zone Color", group=grpZones)
+supplyCol           = input.color(color.new(color.red,   75), "Supply Zone Color", group=grpZones)
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Risk
+// ══════════════════════════════════════════════
+grpRisk      = "── Risk Management ──"
+useATRSL     = input.bool(true,  "ATR-based SL (Fix E)", group=grpRisk)
+atrLen       = input.int(14,     "ATR Length",            minval=2, group=grpRisk)
+atrMult      = input.float(0.5,  "ATR SL Multiplier",     minval=0.1, step=0.1, group=grpRisk)
+slBuffer     = input.float(0.1,  "Fallback SL Buffer (× zone height)", minval=0.0, step=0.05, group=grpRisk,
+     tooltip="Used only when ATR SL is off.")
+minRR        = input.float(1.5,  "Minimum RR for TP1 (Fix D)", minval=0.5, step=0.1, group=grpRisk,
+     tooltip="Reject signals where TP1 distance < N × SL distance.")
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Imbalance
+// ══════════════════════════════════════════════
+grpImb        = "── Imbalance Zones ──"
+showImb       = input.bool(false, "Show Imbalances",                  group=grpImb)
+fvgRecentBars = input.int(100,    "FVG Recency Window (bars) (Fix B)", minval=10, group=grpImb,
+     tooltip="Only FVGs created within this many bars block entries.")
+imbBullCol    = input.color(color.new(color.teal,   80), "Bullish Imbalance Color", group=grpImb)
+imbBearCol    = input.color(color.new(color.orange, 80), "Bearish Imbalance Color", group=grpImb)
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Entry
+// ══════════════════════════════════════════════
+grpEntry     = "── Entry Signals ──"
+showEntry    = input.bool(true,  "Show Entry Signals",                            group=grpEntry)
+showOutcome  = input.bool(true,  "Show Signal Outcome (Win/Loss)",                group=grpEntry)
+tpMulti      = input.float(2.0,  "TP Fallback Multiplier (if no opposing zone)", minval=0.5, step=0.5, group=grpEntry)
+tpLineExtend = input.int(30, "TP/SL Line Extend (bars)", minval=5, group=grpEntry)
+
+// ══════════════════════════════════════════════
+//  SWING PIVOTS
+// ══════════════════════════════════════════════
+swingH = ta.pivothigh(high, lookback, lookback)
+swingL = ta.pivotlow (low,  lookback, lookback)
+
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+
+if not na(swingH)
+    ph2 := ph1
+    ph1 := swingH
+if not na(swingL)
+    pl2 := pl1
+    pl1 := swingL
+
+isHH = not na(swingH) and not na(ph2) and swingH > ph2
+isLH = not na(swingH) and not na(ph2) and swingH < ph2
+isHL = not na(swingL) and not na(pl2) and swingL > pl2
+isLL = not na(swingL) and not na(pl2) and swingL < pl2
+
+if showStructure
+    if isHH
+        label.new(bar_index[lookback], swingH, "HH",
+             xloc=xloc.bar_index, yloc=yloc.abovebar,
+             color=color.new(color.green,75), textcolor=color.green,
+             style=label.style_label_down, size=size.small)
+    if isHL
+        label.new(bar_index[lookback], swingL, "HL",
+             xloc=xloc.bar_index, yloc=yloc.belowbar,
+             color=color.new(color.green,75), textcolor=color.green,
+             style=label.style_label_up, size=size.small)
+    if isLH
+        label.new(bar_index[lookback], swingH, "LH",
+             xloc=xloc.bar_index, yloc=yloc.abovebar,
+             color=color.new(color.red,75), textcolor=color.red,
+             style=label.style_label_down, size=size.small)
+    if isLL
+        label.new(bar_index[lookback], swingL, "LL",
+             xloc=xloc.bar_index, yloc=yloc.belowbar,
+             color=color.new(color.red,75), textcolor=color.red,
+             style=label.style_label_up, size=size.small)
+
+// ══════════════════════════════════════════════
+//  TREND STATE — Fix H (stability gate)
+// ══════════════════════════════════════════════
+var int trend           = 0
+var int bullSignalCount = 0
+var int bearSignalCount = 0
+
+bool bullPivot = isHH or isHL
+bool bearPivot = isLH or isLL
+
+if bullPivot
+    bullSignalCount := bullSignalCount + 1
+    bearSignalCount := 0
+if bearPivot
+    bearSignalCount := bearSignalCount + 1
+    bullSignalCount := 0
+
+if bullSignalCount >= trendStability and trend != 1
+    trend := 1
+if bearSignalCount >= trendStability and trend != -1
+    trend := -1
+
+// HTF trend (Fix F) — compute the same trend on a higher timeframe
+htfTrendRaw = request.security(syminfo.tickerid, htfTimeframe, trend, lookahead=barmerge.lookahead_off)
+int htfTrend = na(htfTrendRaw) ? 0 : int(htfTrendRaw)
+
+// ══════════════════════════════════════════════
+//  BANNER
+// ══════════════════════════════════════════════
+var label bannerLbl = na
+label.delete(bannerLbl)
+string bannerText = trend ==  1 ? "▲  UPTREND   |  Look for LONGS"  :
+                   trend == -1 ? "▼  DOWNTREND  |  Look for SHORTS" :
+                                 "◆  CONSOLIDATION  |  No Trade"
+color  bannerCol  = trend ==  1 ? color.green :
+                   trend == -1 ? color.red    : color.gray
+string htfTxt     = useHTF ? ("  | HTF: " + (htfTrend == 1 ? "▲" : htfTrend == -1 ? "▼" : "◆")) : ""
+bannerLbl := label.new(bar_index, high, text=bannerText + htfTxt,
+     xloc=xloc.bar_index, yloc=yloc.abovebar,
+     color=color.new(bannerCol,80), textcolor=bannerCol,
+     style=label.style_label_left, size=size.normal)
+
+// ══════════════════════════════════════════════
+//  IMPULSE + GAP DETECTION — Fix C (avgBody[1]) + Fix J (volume)
+// ══════════════════════════════════════════════
+float avgBody    = ta.sma(math.abs(close - open), 20)[1]   // Fix C: prior-bar avg
+float volSma     = ta.sma(volume, 20)[1]
+bool  volOK      = not requireVolume or volume >= volSma * volumeMult   // Fix J
+bool  bullImpulse = close > open and (close - open) >= avgBody * impulseStrength and volOK
+bool  bearImpulse = close < open and (open - close) >= avgBody * impulseStrength and volOK
+bool  bullGap     = low  > high[2]
+bool  bearGap     = high < low[2]
+
+float atrVal = ta.atr(atrLen)
+
+// ══════════════════════════════════════════════
+//  ZONE ARRAYS — Potential Entry Demand
+// ══════════════════════════════════════════════
+var box[]   demandBoxes    = array.new<box>()
+var float[] demandTops     = array.new<float>()
+var float[] demandBots     = array.new<float>()
+var label[] demandLabels   = array.new<label>()
+var int[]   demandCreated  = array.new<int>()
+var line[]  demandTPLines  = array.new<line>()
+var line[]  demandTP2Lines = array.new<line>()
+var line[]  demandTP3Lines = array.new<line>()
+var line[]  demandSLLines  = array.new<line>()
+var int[]   demandTaps     = array.new<int>()
+var bool[]  demandWasIn    = array.new<bool>()
+var float[] demandSLPx     = array.new<float>()
+var float[] demandTP1Px    = array.new<float>()
+var float[] demandTP2Px    = array.new<float>()
+var float[] demandTP3Px    = array.new<float>()
+
+// ══════════════════════════════════════════════
+//  ZONE ARRAYS — Potential Entry Supply
+// ══════════════════════════════════════════════
+var box[]   supplyBoxes    = array.new<box>()
+var float[] supplyTops     = array.new<float>()
+var float[] supplyBots     = array.new<float>()
+var label[] supplyLabels   = array.new<label>()
+var int[]   supplyCreated  = array.new<int>()
+var line[]  supplyTPLines  = array.new<line>()
+var line[]  supplyTP2Lines = array.new<line>()
+var line[]  supplyTP3Lines = array.new<line>()
+var line[]  supplySLLines  = array.new<line>()
+var int[]   supplyTaps     = array.new<int>()
+var bool[]  supplyWasIn    = array.new<bool>()
+var float[] supplySLPx     = array.new<float>()
+var float[] supplyTP1Px    = array.new<float>()
+var float[] supplyTP2Px    = array.new<float>()
+var float[] supplyTP3Px    = array.new<float>()
+
+// ══════════════════════════════════════════════
+//  ZONE ARRAYS — Regular (no gap)
+// ══════════════════════════════════════════════
+var box[]   demandRegBoxes   = array.new<box>()
+var float[] demandRegTops    = array.new<float>()
+var label[] demandRegLabels  = array.new<label>()
+var int[]   demandRegCreated = array.new<int>()
+var int[]   demandRegTaps    = array.new<int>()
+var bool[]  demandRegWasIn   = array.new<bool>()
+
+var box[]   supplyRegBoxes   = array.new<box>()
+var float[] supplyRegBots    = array.new<float>()
+var label[] supplyRegLabels  = array.new<label>()
+var int[]   supplyRegCreated = array.new<int>()
+var int[]   supplyRegTaps    = array.new<int>()
+var bool[]  supplyRegWasIn   = array.new<bool>()
+
+// ══════════════════════════════════════════════
+//  IMBALANCE ARRAYS
+// ══════════════════════════════════════════════
+var box[]   bullImbBoxes   = array.new<box>()
+var float[] bullImbTops    = array.new<float>()
+var float[] bullImbBots    = array.new<float>()
+var label[] bullImbLabels  = array.new<label>()
+var int[]   bullImbCreated = array.new<int>()
+
+var box[]   bearImbBoxes   = array.new<box>()
+var float[] bearImbTops    = array.new<float>()
+var float[] bearImbBots    = array.new<float>()
+var label[] bearImbLabels  = array.new<label>()
+var int[]   bearImbCreated = array.new<int>()
+
+// ══════════════════════════════════════════════
+//  SL CALCULATOR — Fix E (ATR option)
+// ══════════════════════════════════════════════
+calcLongSL(zTop, zBot) =>
+    useATRSL ? zBot - atrVal * atrMult : zBot - (zTop - zBot) * slBuffer
+
+calcShortSL(zTop, zBot) =>
+    useATRSL ? zTop + atrVal * atrMult : zTop + (zTop - zBot) * slBuffer
+
+// ══════════════════════════════════════════════
+//  MULTI-TP FINDERS
+// ══════════════════════════════════════════════
+findLongTPs(entryPrice, slPrice) =>
+    float[] cands = array.new<float>()
+    if array.size(supplyBoxes) > 0
+        for k = 0 to array.size(supplyBoxes) - 1
+            float zBot = array.get(supplyBots, k)
+            if zBot > entryPrice
+                array.push(cands, zBot)
+    if array.size(supplyRegBoxes) > 0
+        for k = 0 to array.size(supplyRegBoxes) - 1
+            float zBot = array.get(supplyRegBots, k)
+            if zBot > entryPrice
+                array.push(cands, zBot)
+    array.sort(cands, order.ascending)
+    float tp1 = array.size(cands) >= 1 ? array.get(cands, 0) : entryPrice + (entryPrice - slPrice) * tpMulti
+    float tp2 = array.size(cands) >= 2 ? array.get(cands, 1) : na
+    float tp3 = array.size(cands) >= 3 ? array.get(cands, 2) : na
+    [tp1, tp2, tp3]
+
+findShortTPs(entryPrice, slPrice) =>
+    float[] cands = array.new<float>()
+    if array.size(demandBoxes) > 0
+        for k = 0 to array.size(demandBoxes) - 1
+            float zTop = array.get(demandTops, k)
+            if zTop < entryPrice
+                array.push(cands, zTop)
+    if array.size(demandRegBoxes) > 0
+        for k = 0 to array.size(demandRegBoxes) - 1
+            float zTop = array.get(demandRegTops, k)
+            if zTop < entryPrice
+                array.push(cands, zTop)
+    array.sort(cands, order.descending)
+    float tp1 = array.size(cands) >= 1 ? array.get(cands, 0) : entryPrice - (slPrice - entryPrice) * tpMulti
+    float tp2 = array.size(cands) >= 2 ? array.get(cands, 1) : na
+    float tp3 = array.size(cands) >= 3 ? array.get(cands, 2) : na
+    [tp1, tp2, tp3]
+
+// ══════════════════════════════════════════════
+//  HELPER: build multi-TP label text
+// ══════════════════════════════════════════════
+tpLabelLines(tp1, tp2, tp3, dir) =>
+    string d  = dir == 1 ? "(supply)" : "(demand)"
+    string t1 = "TP1  : " + str.tostring(tp1, format.mintick) + "  " + d
+    string t2 = na(tp2) ? "" : "\nTP2  : " + str.tostring(tp2, format.mintick) + "  " + d
+    string t3 = na(tp3) ? "" : "\nTP3  : " + str.tostring(tp3, format.mintick) + "  " + d
+    t1 + t2 + t3
+
+// ══════════════════════════════════════════════
+//  INSIDE NEAR-PRICE FVG — Fix B (recent only)
+// ══════════════════════════════════════════════
+bool insideAnyFVG = false
+if array.size(bullImbBoxes) > 0
+    for k = 0 to array.size(bullImbBoxes) - 1
+        if bar_index - array.get(bullImbCreated, k) < fvgRecentBars
+            if close >= array.get(bullImbBots, k) and close <= array.get(bullImbTops, k)
+                insideAnyFVG := true
+if array.size(bearImbBoxes) > 0
+    for k = 0 to array.size(bearImbBoxes) - 1
+        if bar_index - array.get(bearImbCreated, k) < fvgRecentBars
+            if close >= array.get(bearImbBots, k) and close <= array.get(bearImbTops, k)
+                insideAnyFVG := true
+
+// ══════════════════════════════════════════════
+//  ENTRY SIGNALS — Fix A (closest zone) + D (min RR) + F (HTF) + G (2nd test)
+// ══════════════════════════════════════════════
+bool  longSig        = false
+bool  shortSig       = false
+float sigLongEntry   = na
+float sigLongSL      = na
+float sigLongTP1     = na
+float sigLongTP2     = na
+float sigLongTP3     = na
+float sigShortEntry  = na
+float sigShortSL     = na
+float sigShortTP1    = na
+float sigShortTP2    = na
+float sigShortTP3    = na
+
+bool htfBullOK = not useHTF or htfTrend == 1
+bool htfBearOK = not useHTF or htfTrend == -1
+
+if showEntry and trend == 1 and htfBullOK and not insideAnyFVG and array.size(demandBoxes) > 0
+    // Fix A: find demand zone with HIGHEST top that is still BELOW current price
+    float bestTop = na
+    float bestBot = na
+    int   bestIdx = -1
+    for k = 0 to array.size(demandBoxes) - 1
+        float zTop   = array.get(demandTops,    k)
+        float zBot   = array.get(demandBots,    k)
+        int   crated = array.get(demandCreated, k)
+        int   taps   = array.get(demandTaps,    k)
+        bool  qualifies = bar_index > crated and zTop < close
+        // Fix G: only fire on 2nd test if enabled
+        if fireOnSecondTest
+            qualifies := qualifies and taps == 1
+        else
+            qualifies := qualifies and taps == 0
+        if qualifies
+            if na(bestTop) or zTop > bestTop
+                bestTop := zTop
+                bestBot := zBot
+                bestIdx := k
+    if not na(bestTop) and low <= bestTop and close > bestTop
+        float sl             = calcLongSL(bestTop, bestBot)
+        [t1, t2, t3]         = findLongTPs(bestTop, sl)
+        // Fix D: min RR gate
+        float rr = (bestTop - sl) > 0 ? (t1 - bestTop) / (bestTop - sl) : 0
+        if rr >= minRR
+            longSig             := true
+            sigLongEntry        := bestTop
+            sigLongSL           := sl
+            sigLongTP1          := t1
+            sigLongTP2          := t2
+            sigLongTP3          := t3
+
+if showEntry and trend == -1 and htfBearOK and not insideAnyFVG and array.size(supplyBoxes) > 0
+    // Fix A: find supply zone with LOWEST bot that is still ABOVE current price
+    float bestBot2 = na
+    float bestTop2 = na
+    int   bestIdx2 = -1
+    for k = 0 to array.size(supplyBoxes) - 1
+        float zTop   = array.get(supplyTops,    k)
+        float zBot   = array.get(supplyBots,    k)
+        int   crated = array.get(supplyCreated, k)
+        int   taps   = array.get(supplyTaps,    k)
+        bool  qualifies = bar_index > crated and zBot > close
+        if fireOnSecondTest
+            qualifies := qualifies and taps == 1
+        else
+            qualifies := qualifies and taps == 0
+        if qualifies
+            if na(bestBot2) or zBot < bestBot2
+                bestBot2 := zBot
+                bestTop2 := zTop
+                bestIdx2 := k
+    if not na(bestBot2) and high >= bestBot2 and close < bestBot2
+        float sl              = calcShortSL(bestTop2, bestBot2)
+        [t1, t2, t3]          = findShortTPs(bestBot2, sl)
+        float rr = (sl - bestBot2) > 0 ? (bestBot2 - t1) / (sl - bestBot2) : 0
+        if rr >= minRR
+            shortSig             := true
+            sigShortEntry        := bestBot2
+            sigShortSL           := sl
+            sigShortTP1          := t1
+            sigShortTP2          := t2
+            sigShortTP3          := t3
+
+// ══════════════════════════════════════════════
+//  ZONES — TAP LOGIC — Fix G (don't delete on 1st tap if 2nd-test mode)
+// ══════════════════════════════════════════════
+if showZones
+    // ── Potential Entry DEMAND ──
+    if array.size(demandBoxes) > 0
+        int di = array.size(demandBoxes) - 1
+        while di >= 0
+            float zTop   = array.get(demandTops,   di)
+            int   crated = array.get(demandCreated, di)
+            bool  wasIn  = array.get(demandWasIn,   di)
+            int   taps   = array.get(demandTaps,    di)
+            bool  isIn   = bar_index > crated and low <= zTop
+            bool  newTap = isIn and not wasIn
+            array.set(demandWasIn, di, isIn)
+            if newTap
+                int newTaps = taps + 1
+                // Fix G: keep zone alive for the 2nd test when enabled
+                bool deleteNow = fireOnSecondTest ? newTaps >= 2 : (newTaps >= 1 and not showTestedPotential)
+                if deleteNow
+                    box.delete  (array.get(demandBoxes,   di))
+                    label.delete(array.get(demandLabels,  di))
+                    line.delete (array.get(demandTPLines, di))
+                    line.delete (array.get(demandTP2Lines,di))
+                    line.delete (array.get(demandTP3Lines,di))
+                    line.delete (array.get(demandSLLines, di))
+                    array.remove(demandBoxes,    di)
+                    array.remove(demandTops,     di)
+                    array.remove(demandBots,     di)
+                    array.remove(demandLabels,   di)
+                    array.remove(demandCreated,  di)
+                    array.remove(demandTPLines,  di)
+                    array.remove(demandTP2Lines, di)
+                    array.remove(demandTP3Lines, di)
+                    array.remove(demandSLLines,  di)
+                    array.remove(demandTaps,     di)
+                    array.remove(demandWasIn,    di)
+                    array.remove(demandSLPx,     di)
+                    array.remove(demandTP1Px,    di)
+                    array.remove(demandTP2Px,    di)
+                    array.remove(demandTP3Px,    di)
+                else
+                    box.set_bgcolor      (array.get(demandBoxes,   di), color.new(color.green, 93))
+                    box.set_border_color (array.get(demandBoxes,   di), color.new(color.lime,  80))
+                    label.set_color      (array.get(demandLabels,  di), color.new(color.green, 70))
+                    label.set_textcolor  (array.get(demandLabels,  di), color.new(color.white, 50))
+                    line.set_color       (array.get(demandTPLines, di), color.new(color.green, 75))
+                    line.set_color       (array.get(demandSLLines, di), color.new(color.red,   75))
+                    array.set(demandTaps, di, newTaps)
+            di -= 1
+
+    // ── Potential Entry SUPPLY ──
+    if array.size(supplyBoxes) > 0
+        int si = array.size(supplyBoxes) - 1
+        while si >= 0
+            float zBot   = array.get(supplyBots,   si)
+            int   crated = array.get(supplyCreated, si)
+            bool  wasIn  = array.get(supplyWasIn,   si)
+            int   taps   = array.get(supplyTaps,    si)
+            bool  isIn   = bar_index > crated and high >= zBot
+            bool  newTap = isIn and not wasIn
+            array.set(supplyWasIn, si, isIn)
+            if newTap
+                int newTaps = taps + 1
+                bool deleteNow = fireOnSecondTest ? newTaps >= 2 : (newTaps >= 1 and not showTestedPotential)
+                if deleteNow
+                    box.delete  (array.get(supplyBoxes,   si))
+                    label.delete(array.get(supplyLabels,  si))
+                    line.delete (array.get(supplyTPLines, si))
+                    line.delete (array.get(supplyTP2Lines,si))
+                    line.delete (array.get(supplyTP3Lines,si))
+                    line.delete (array.get(supplySLLines, si))
+                    array.remove(supplyBoxes,    si)
+                    array.remove(supplyTops,     si)
+                    array.remove(supplyBots,     si)
+                    array.remove(supplyLabels,   si)
+                    array.remove(supplyCreated,  si)
+                    array.remove(supplyTPLines,  si)
+                    array.remove(supplyTP2Lines, si)
+                    array.remove(supplyTP3Lines, si)
+                    array.remove(supplySLLines,  si)
+                    array.remove(supplyTaps,     si)
+                    array.remove(supplyWasIn,    si)
+                    array.remove(supplySLPx,     si)
+                    array.remove(supplyTP1Px,    si)
+                    array.remove(supplyTP2Px,    si)
+                    array.remove(supplyTP3Px,    si)
+                else
+                    box.set_bgcolor      (array.get(supplyBoxes,   si), color.new(color.red, 93))
+                    box.set_border_color (array.get(supplyBoxes,   si), color.new(color.red, 80))
+                    label.set_color      (array.get(supplyLabels,  si), color.new(color.red,   70))
+                    label.set_textcolor  (array.get(supplyLabels,  si), color.new(color.white, 50))
+                    line.set_color       (array.get(supplyTPLines, si), color.new(color.green, 75))
+                    line.set_color       (array.get(supplySLLines, si), color.new(color.red,   75))
+                    array.set(supplyTaps, si, newTaps)
+            si -= 1
+
+    // ── Regular DEMAND ──
+    if array.size(demandRegBoxes) > 0
+        int dri = array.size(demandRegBoxes) - 1
+        while dri >= 0
+            float zTop   = array.get(demandRegTops,    dri)
+            int   crated = array.get(demandRegCreated, dri)
+            bool  wasIn  = array.get(demandRegWasIn,   dri)
+            int   taps   = array.get(demandRegTaps,    dri)
+            bool  isIn   = bar_index > crated and low <= zTop
+            bool  newTap = isIn and not wasIn
+            array.set(demandRegWasIn, dri, isIn)
+            if newTap
+                if taps >= 1 or not showTestedRegular
+                    box.delete  (array.get(demandRegBoxes,  dri))
+                    label.delete(array.get(demandRegLabels, dri))
+                    array.remove(demandRegBoxes,   dri)
+                    array.remove(demandRegTops,    dri)
+                    array.remove(demandRegLabels,  dri)
+                    array.remove(demandRegCreated, dri)
+                    array.remove(demandRegTaps,    dri)
+                    array.remove(demandRegWasIn,   dri)
+                else
+                    box.set_bgcolor      (array.get(demandRegBoxes,  dri), color.new(color.green, 96))
+                    box.set_border_color (array.get(demandRegBoxes,  dri), color.new(color.green, 88))
+                    label.set_color      (array.get(demandRegLabels, dri), color.new(color.green, 80))
+                    label.set_text       (array.get(demandRegLabels, dri), "Tested Demand Zone")
+                    array.set(demandRegTaps, dri, 1)
+            dri -= 1
+
+    // ── Regular SUPPLY ──
+    if array.size(supplyRegBoxes) > 0
+        int sri = array.size(supplyRegBoxes) - 1
+        while sri >= 0
+            float zBot   = array.get(supplyRegBots,    sri)
+            int   crated = array.get(supplyRegCreated, sri)
+            bool  wasIn  = array.get(supplyRegWasIn,   sri)
+            int   taps   = array.get(supplyRegTaps,    sri)
+            bool  isIn   = bar_index > crated and high >= zBot
+            bool  newTap = isIn and not wasIn
+            array.set(supplyRegWasIn, sri, isIn)
+            if newTap
+                if taps >= 1 or not showTestedRegular
+                    box.delete  (array.get(supplyRegBoxes,  sri))
+                    label.delete(array.get(supplyRegLabels, sri))
+                    array.remove(supplyRegBoxes,   sri)
+                    array.remove(supplyRegBots,    sri)
+                    array.remove(supplyRegLabels,  sri)
+                    array.remove(supplyRegCreated, sri)
+                    array.remove(supplyRegTaps,    sri)
+                    array.remove(supplyRegWasIn,   sri)
+                else
+                    box.set_bgcolor      (array.get(supplyRegBoxes,  sri), color.new(color.red, 96))
+                    box.set_border_color (array.get(supplyRegBoxes,  sri), color.new(color.red, 88))
+                    label.set_color      (array.get(supplyRegLabels, sri), color.new(color.red, 80))
+                    label.set_text       (array.get(supplyRegLabels, sri), "Tested Supply Zone")
+                    array.set(supplyRegTaps, sri, 1)
+            sri -= 1
+
+// ══════════════════════════════════════════════
+//  ZONE BUILDER — Fix I (base candle as zone)
+// ══════════════════════════════════════════════
+// For a bullish impulse on bar [1], the base candle is the most recent
+// red (or doji) candle BEFORE the impulse, scanning back up to 5 bars.
+buildBullZone() =>
+    float zTop = na
+    float zBot = na
+    if useBaseCandle
+        for j = 2 to 6
+            if close[j] <= open[j]   // red or doji = supply pressure / origin
+                zTop := high[j]
+                zBot := low[j]
+                break
+        if na(zTop)
+            zTop := high[1]
+            zBot := low[1]
+    else
+        zTop := high[1]
+        zBot := low[1]
+    [zTop, zBot]
+
+buildBearZone() =>
+    float zTop = na
+    float zBot = na
+    if useBaseCandle
+        for j = 2 to 6
+            if close[j] >= open[j]   // green or doji = demand pressure / origin
+                zTop := high[j]
+                zBot := low[j]
+                break
+        if na(zTop)
+            zTop := high[1]
+            zBot := low[1]
+    else
+        zTop := high[1]
+        zBot := low[1]
+    [zTop, zBot]
+
+// ══════════════════════════════════════════════
+//  ZONES — CREATE
+// ══════════════════════════════════════════════
+if showZones
+    int rEdge = bar_index + rightExtend
+
+    // ── Demand Zone ──
+    if bullImpulse and trend == 1
+        [zTop, zBot] = buildBullZone()
+        // Fix #8: meaningful sanity check — zone must have non-trivial height
+        float minHeight = atrVal * 0.05
+        if not na(zTop) and not na(zBot) and (zTop - zBot) > minHeight
+            float entryPx    = zTop
+            float slPx       = calcLongSL(zTop, zBot)
+            [tp1, tp2, tp3]  = findLongTPs(entryPx, slPx)
+            string tpTxt     = tpLabelLines(tp1, tp2, tp3, 1)
+            if bullGap
+                b    = box.new(bar_index[1], zTop, rEdge, zBot,
+                         bgcolor=demandCol, border_color=color.new(color.lime,10), border_width=2)
+                lbl  = label.new(bar_index[1], zBot,
+                         "★  Potential Entry Zone\n" +
+                         "──  Long Limit Order  ──\n" +
+                         "Entry : " + str.tostring(entryPx, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,   format.mintick) + "\n" +
+                         tpTxt,
+                         xloc=xloc.bar_index, yloc=yloc.price,
+                         color=color.new(color.green,10), textcolor=color.white,
+                         style=label.style_label_up, size=size.small)
+                tpLn1 = line.new(bar_index[1], tp1, rEdge, tp1,
+                          color=color.new(color.green,10), width=2, style=line.style_solid)
+                tpLn2 = not na(tp2) ?
+                          line.new(bar_index[1], tp2, rEdge, tp2,
+                          color=color.new(color.green,30), width=1, style=line.style_dashed) :
+                          line.new(bar_index[1], tp1, bar_index[1], tp1,
+                          color=color.new(color.green,99), width=1)
+                tpLn3 = not na(tp3) ?
+                          line.new(bar_index[1], tp3, rEdge, tp3,
+                          color=color.new(color.green,50), width=1, style=line.style_dotted) :
+                          line.new(bar_index[1], tp1, bar_index[1], tp1,
+                          color=color.new(color.green,99), width=1)
+                slLn  = line.new(bar_index[1], slPx, rEdge, slPx,
+                          color=color.new(color.red,30), width=1, style=line.style_dotted)
+                array.push(demandBoxes,    b)
+                array.push(demandTops,     zTop)
+                array.push(demandBots,     zBot)
+                array.push(demandLabels,   lbl)
+                array.push(demandCreated,  bar_index)
+                array.push(demandTPLines,  tpLn1)
+                array.push(demandTP2Lines, tpLn2)
+                array.push(demandTP3Lines, tpLn3)
+                array.push(demandSLLines,  slLn)
+                array.push(demandTaps,     0)
+                array.push(demandWasIn,    false)
+                array.push(demandSLPx,     slPx)
+                array.push(demandTP1Px,    tp1)
+                array.push(demandTP2Px,    tp2)
+                array.push(demandTP3Px,    tp3)
+            else
+                b   = box.new(bar_index[1], zTop, rEdge, zBot,
+                        bgcolor=color.new(color.green,88), border_color=color.new(color.green,60), border_width=1)
+                lbl = label.new(bar_index[1], zBot, "Demand Zone",
+                        xloc=xloc.bar_index, yloc=yloc.price,
+                        color=color.new(color.green,50), textcolor=color.white,
+                        style=label.style_label_up, size=size.tiny)
+                array.push(demandRegBoxes,   b)
+                array.push(demandRegTops,    zTop)
+                array.push(demandRegLabels,  lbl)
+                array.push(demandRegCreated, bar_index)
+                array.push(demandRegTaps,    0)
+                array.push(demandRegWasIn,   false)
+
+    // ── Supply Zone ──
+    if bearImpulse and trend == -1
+        [zTop, zBot] = buildBearZone()
+        float minHeight = atrVal * 0.05
+        if not na(zTop) and not na(zBot) and (zTop - zBot) > minHeight
+            float entryPx    = zBot
+            float slPx       = calcShortSL(zTop, zBot)
+            [tp1, tp2, tp3]  = findShortTPs(entryPx, slPx)
+            string tpTxt     = tpLabelLines(tp1, tp2, tp3, -1)
+            if bearGap
+                b    = box.new(bar_index[1], zTop, rEdge, zBot,
+                         bgcolor=supplyCol, border_color=color.new(color.red,10), border_width=2)
+                lbl  = label.new(bar_index[1], zTop,
+                         "★  Potential Entry Zone\n" +
+                         "── Short Limit Order ──\n" +
+                         "Entry : " + str.tostring(entryPx, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,   format.mintick) + "\n" +
+                         tpTxt,
+                         xloc=xloc.bar_index, yloc=yloc.price,
+                         color=color.new(color.red,10), textcolor=color.white,
+                         style=label.style_label_down, size=size.small)
+                tpLn1 = line.new(bar_index[1], tp1, rEdge, tp1,
+                          color=color.new(color.green,10), width=2, style=line.style_solid)
+                tpLn2 = not na(tp2) ?
+                          line.new(bar_index[1], tp2, rEdge, tp2,
+                          color=color.new(color.green,30), width=1, style=line.style_dashed) :
+                          line.new(bar_index[1], tp1, bar_index[1], tp1,
+                          color=color.new(color.green,99), width=1)
+                tpLn3 = not na(tp3) ?
+                          line.new(bar_index[1], tp3, rEdge, tp3,
+                          color=color.new(color.green,50), width=1, style=line.style_dotted) :
+                          line.new(bar_index[1], tp1, bar_index[1], tp1,
+                          color=color.new(color.green,99), width=1)
+                slLn  = line.new(bar_index[1], slPx, rEdge, slPx,
+                          color=color.new(color.red,30), width=1, style=line.style_dotted)
+                array.push(supplyBoxes,    b)
+                array.push(supplyTops,     zTop)
+                array.push(supplyBots,     zBot)
+                array.push(supplyLabels,   lbl)
+                array.push(supplyCreated,  bar_index)
+                array.push(supplyTPLines,  tpLn1)
+                array.push(supplyTP2Lines, tpLn2)
+                array.push(supplyTP3Lines, tpLn3)
+                array.push(supplySLLines,  slLn)
+                array.push(supplyTaps,     0)
+                array.push(supplyWasIn,    false)
+                array.push(supplySLPx,     slPx)
+                array.push(supplyTP1Px,    tp1)
+                array.push(supplyTP2Px,    tp2)
+                array.push(supplyTP3Px,    tp3)
+            else
+                b   = box.new(bar_index[1], zTop, rEdge, zBot,
+                        bgcolor=color.new(color.red,88), border_color=color.new(color.red,60), border_width=1)
+                lbl = label.new(bar_index[1], zTop, "Supply Zone",
+                        xloc=xloc.bar_index, yloc=yloc.price,
+                        color=color.new(color.red,50), textcolor=color.white,
+                        style=label.style_label_down, size=size.tiny)
+                array.push(supplyRegBoxes,   b)
+                array.push(supplyRegBots,    zBot)
+                array.push(supplyRegLabels,  lbl)
+                array.push(supplyRegCreated, bar_index)
+                array.push(supplyRegTaps,    0)
+                array.push(supplyRegWasIn,   false)
+
+// ══════════════════════════════════════════════
+//  ZONES — EXTEND RIGHT EDGES + LIVE P&L
+// ══════════════════════════════════════════════
+if showZones
+    int rEdge = bar_index + rightExtend
+
+    // ── Potential Demand ──
+    if array.size(demandBoxes) > 0
+        for k = 0 to array.size(demandBoxes) - 1
+            box.set_right (array.get(demandBoxes,    k), rEdge)
+            line.set_x2   (array.get(demandTPLines,  k), rEdge)
+            line.set_x2   (array.get(demandTP2Lines, k), rEdge)
+            line.set_x2   (array.get(demandTP3Lines, k), rEdge)
+            line.set_x2   (array.get(demandSLLines,  k), rEdge)
+            int   st   = array.get(demandTaps,   k)
+            float entry= array.get(demandTops,   k)
+            float slPx = array.get(demandSLPx,   k)
+            float tp1  = array.get(demandTP1Px,  k)
+            float tp2  = array.get(demandTP2Px,  k)
+            float tp3  = array.get(demandTP3Px,  k)
+            string tpTxt = tpLabelLines(tp1, tp2, tp3, 1)
+            if st >= 1
+                bool tp1Hit = high >= tp1
+                bool tp2Hit = not na(tp2) and high >= tp2
+                bool tp3Hit = not na(tp3) and high >= tp3
+                bool slHit  = low <= slPx
+                if tp3Hit
+                    label.set_text     (array.get(demandLabels, k),
+                         "✅  TP3 Hit — Maximum Profit!\n── Long (Demand) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(demandLabels, k), color.new(color.green, 0))
+                    label.set_textcolor(array.get(demandLabels, k), color.white)
+                else if tp2Hit
+                    label.set_text     (array.get(demandLabels, k),
+                         "✅  TP2 Hit — Running to TP3\n── Long (Demand) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(demandLabels, k), color.new(color.green, 20))
+                    label.set_textcolor(array.get(demandLabels, k), color.white)
+                else if tp1Hit
+                    label.set_text     (array.get(demandLabels, k),
+                         "✅  TP1 Hit — Running to TP2\n── Long (Demand) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(demandLabels, k), color.new(color.green, 40))
+                    label.set_textcolor(array.get(demandLabels, k), color.white)
+                else if slHit
+                    label.set_text     (array.get(demandLabels, k),
+                         "❌  SL Hit — Trade Closed in Loss\n── Long (Demand) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(demandLabels, k), color.new(color.red, 10))
+                    label.set_textcolor(array.get(demandLabels, k), color.white)
+                else
+                    bool inProfit = close > entry
+                    label.set_text(array.get(demandLabels, k),
+                         (inProfit ? "✅  Trade Running — In Profit" : "⚠️  Trade Running — In Loss") + "\n" +
+                         "── Long (Demand) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+
+    // ── Potential Supply ──
+    if array.size(supplyBoxes) > 0
+        for k = 0 to array.size(supplyBoxes) - 1
+            box.set_right (array.get(supplyBoxes,    k), rEdge)
+            line.set_x2   (array.get(supplyTPLines,  k), rEdge)
+            line.set_x2   (array.get(supplyTP2Lines, k), rEdge)
+            line.set_x2   (array.get(supplyTP3Lines, k), rEdge)
+            line.set_x2   (array.get(supplySLLines,  k), rEdge)
+            int   st   = array.get(supplyTaps,   k)
+            float entry= array.get(supplyBots,   k)
+            float slPx = array.get(supplySLPx,   k)
+            float tp1  = array.get(supplyTP1Px,  k)
+            float tp2  = array.get(supplyTP2Px,  k)
+            float tp3  = array.get(supplyTP3Px,  k)
+            string tpTxt = tpLabelLines(tp1, tp2, tp3, -1)
+            if st >= 1
+                bool tp1Hit = low  <= tp1
+                bool tp2Hit = not na(tp2) and low  <= tp2
+                bool tp3Hit = not na(tp3) and low  <= tp3
+                bool slHit  = high >= slPx
+                if tp3Hit
+                    label.set_text     (array.get(supplyLabels, k),
+                         "✅  TP3 Hit — Maximum Profit!\n── Short (Supply) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(supplyLabels, k), color.new(color.green, 0))
+                    label.set_textcolor(array.get(supplyLabels, k), color.white)
+                else if tp2Hit
+                    label.set_text     (array.get(supplyLabels, k),
+                         "✅  TP2 Hit — Running to TP3\n── Short (Supply) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(supplyLabels, k), color.new(color.green, 20))
+                    label.set_textcolor(array.get(supplyLabels, k), color.white)
+                else if tp1Hit
+                    label.set_text     (array.get(supplyLabels, k),
+                         "✅  TP1 Hit — Running to TP2\n── Short (Supply) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(supplyLabels, k), color.new(color.green, 40))
+                    label.set_textcolor(array.get(supplyLabels, k), color.white)
+                else if slHit
+                    label.set_text     (array.get(supplyLabels, k),
+                         "❌  SL Hit — Trade Closed in Loss\n── Short (Supply) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+                    label.set_color    (array.get(supplyLabels, k), color.new(color.red, 10))
+                    label.set_textcolor(array.get(supplyLabels, k), color.white)
+                else
+                    bool inProfit = close < entry
+                    label.set_text(array.get(supplyLabels, k),
+                         (inProfit ? "✅  Trade Running — In Profit" : "⚠️  Trade Running — In Loss") + "\n" +
+                         "── Short (Supply) ──\n" +
+                         "Entry : " + str.tostring(entry, format.mintick) + "\n" +
+                         "SL      : " + str.tostring(slPx,  format.mintick) + "\n" + tpTxt)
+
+    if array.size(demandRegBoxes) > 0
+        for k = 0 to array.size(demandRegBoxes) - 1
+            box.set_right(array.get(demandRegBoxes, k), rEdge)
+    if array.size(supplyRegBoxes) > 0
+        for k = 0 to array.size(supplyRegBoxes) - 1
+            box.set_right(array.get(supplyRegBoxes, k), rEdge)
+
+// ══════════════════════════════════════════════
+//  IMBALANCE ZONES — DELETE + CREATE
+// ══════════════════════════════════════════════
+if showImb
+    if array.size(bullImbBoxes) > 0
+        int bi = array.size(bullImbBoxes) - 1
+        while bi >= 0
+            if bar_index > array.get(bullImbCreated, bi) and low <= array.get(bullImbTops, bi)
+                box.delete  (array.get(bullImbBoxes,  bi))
+                label.delete(array.get(bullImbLabels, bi))
+                array.remove(bullImbBoxes,   bi)
+                array.remove(bullImbTops,    bi)
+                array.remove(bullImbBots,    bi)
+                array.remove(bullImbLabels,  bi)
+                array.remove(bullImbCreated, bi)
+            bi -= 1
+    if array.size(bearImbBoxes) > 0
+        int bri = array.size(bearImbBoxes) - 1
+        while bri >= 0
+            if bar_index > array.get(bearImbCreated, bri) and high >= array.get(bearImbBots, bri)
+                box.delete  (array.get(bearImbBoxes,  bri))
+                label.delete(array.get(bearImbLabels, bri))
+                array.remove(bearImbBoxes,   bri)
+                array.remove(bearImbTops,    bri)
+                array.remove(bearImbBots,    bri)
+                array.remove(bearImbLabels,  bri)
+                array.remove(bearImbCreated, bri)
+            bri -= 1
+    bool bullImb = low  > high[2]
+    bool bearImb = high < low[2]
+    int  rEdge   = bar_index + rightExtend
+    if bullImb
+        float gapBot = high[2]
+        float gapTop = low
+        if gapTop > gapBot
+            b   = box.new(bar_index, gapTop, rEdge, gapBot,
+                 bgcolor=imbBullCol, border_color=color.new(color.teal,50), border_width=1)
+            lbl = label.new(bar_index, (gapTop + gapBot) / 2, "IMB ▲",
+                 xloc=xloc.bar_index, yloc=yloc.price,
+                 color=color.new(color.teal,70), textcolor=color.teal,
+                 style=label.style_label_right, size=size.tiny)
+            array.push(bullImbBoxes,   b)
+            array.push(bullImbTops,    gapTop)
+            array.push(bullImbBots,    gapBot)
+            array.push(bullImbLabels,  lbl)
+            array.push(bullImbCreated, bar_index)
+    if bearImb
+        float gapBot = high
+        float gapTop = low[2]
+        if gapTop > gapBot
+            b   = box.new(bar_index, gapTop, rEdge, gapBot,
+                 bgcolor=imbBearCol, border_color=color.new(color.orange,50), border_width=1)
+            lbl = label.new(bar_index, (gapTop + gapBot) / 2, "IMB ▼",
+                 xloc=xloc.bar_index, yloc=yloc.price,
+                 color=color.new(color.orange,70), textcolor=color.orange,
+                 style=label.style_label_right, size=size.tiny)
+            array.push(bearImbBoxes,   b)
+            array.push(bearImbTops,    gapTop)
+            array.push(bearImbBots,    gapBot)
+            array.push(bearImbLabels,  lbl)
+            array.push(bearImbCreated, bar_index)
+    if array.size(bullImbBoxes) > 0
+        for k = 0 to array.size(bullImbBoxes) - 1
+            box.set_right(array.get(bullImbBoxes, k), bar_index + rightExtend)
+    if array.size(bearImbBoxes) > 0
+        for k = 0 to array.size(bearImbBoxes) - 1
+            box.set_right(array.get(bearImbBoxes, k), bar_index + rightExtend)
+
+// ══════════════════════════════════════════════
+//  SIGNAL OUTCOME TRACKING
+// ══════════════════════════════════════════════
+var int[]   longSigBars  = array.new<int>()
+var float[] longSigEntry = array.new<float>()
+var float[] longSigTP1   = array.new<float>()
+var float[] longSigTP2   = array.new<float>()
+var float[] longSigTP3   = array.new<float>()
+var float[] longSigSL    = array.new<float>()
+var int[]   longSigState = array.new<int>()
+
+var int[]   shortSigBars  = array.new<int>()
+var float[] shortSigEntry = array.new<float>()
+var float[] shortSigTP1   = array.new<float>()
+var float[] shortSigTP2   = array.new<float>()
+var float[] shortSigTP3   = array.new<float>()
+var float[] shortSigSL    = array.new<float>()
+var int[]   shortSigState = array.new<int>()
+
+if showOutcome and array.size(longSigBars) > 0
+    int oi = array.size(longSigBars) - 1
+    while oi >= 0
+        int   sigBar   = array.get(longSigBars,  oi)
+        float tp1      = array.get(longSigTP1,   oi)
+        float tp2      = array.get(longSigTP2,   oi)
+        float tp3      = array.get(longSigTP3,   oi)
+        float sigSL    = array.get(longSigSL,    oi)
+        int   st       = array.get(longSigState, oi)
+        if bar_index > sigBar
+            bool hitSL  = low  <= sigSL
+            bool hitTP1 = high >= tp1   and st < 1
+            bool hitTP2 = not na(tp2) and high >= tp2 and st < 2
+            bool hitTP3 = not na(tp3) and high >= tp3 and st < 3
+            if hitSL
+                label.new(bar_index, low, "✗  LOSS\nSL Hit",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.red,10), textcolor=color.white,
+                     style=label.style_label_up, size=size.small)
+                array.remove(longSigBars,  oi)
+                array.remove(longSigEntry, oi)
+                array.remove(longSigTP1,   oi)
+                array.remove(longSigTP2,   oi)
+                array.remove(longSigTP3,   oi)
+                array.remove(longSigSL,    oi)
+                array.remove(longSigState, oi)
+            else if hitTP3
+                label.new(bar_index, high, "✓  TP3 HIT\nMaximum Profit",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,0), textcolor=color.white,
+                     style=label.style_label_down, size=size.small)
+                array.remove(longSigBars,  oi)
+                array.remove(longSigEntry, oi)
+                array.remove(longSigTP1,   oi)
+                array.remove(longSigTP2,   oi)
+                array.remove(longSigTP3,   oi)
+                array.remove(longSigSL,    oi)
+                array.remove(longSigState, oi)
+            else if hitTP2
+                label.new(bar_index, high, "✓  TP2 HIT\nRunning to TP3",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,20), textcolor=color.white,
+                     style=label.style_label_down, size=size.small)
+                array.set(longSigState, oi, 2)
+            else if hitTP1
+                label.new(bar_index, high, "✓  TP1 HIT\nRunning to TP2",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,40), textcolor=color.white,
+                     style=label.style_label_down, size=size.small)
+                array.set(longSigState, oi, 1)
+        oi -= 1
+
+if showOutcome and array.size(shortSigBars) > 0
+    int oi = array.size(shortSigBars) - 1
+    while oi >= 0
+        int   sigBar   = array.get(shortSigBars,  oi)
+        float tp1      = array.get(shortSigTP1,   oi)
+        float tp2      = array.get(shortSigTP2,   oi)
+        float tp3      = array.get(shortSigTP3,   oi)
+        float sigSL    = array.get(shortSigSL,    oi)
+        int   st       = array.get(shortSigState, oi)
+        if bar_index > sigBar
+            bool hitSL  = high >= sigSL
+            bool hitTP1 = low  <= tp1   and st < 1
+            bool hitTP2 = not na(tp2) and low  <= tp2 and st < 2
+            bool hitTP3 = not na(tp3) and low  <= tp3 and st < 3
+            if hitSL
+                label.new(bar_index, high, "✗  LOSS\nSL Hit",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.red,10), textcolor=color.white,
+                     style=label.style_label_down, size=size.small)
+                array.remove(shortSigBars,  oi)
+                array.remove(shortSigEntry, oi)
+                array.remove(shortSigTP1,   oi)
+                array.remove(shortSigTP2,   oi)
+                array.remove(shortSigTP3,   oi)
+                array.remove(shortSigSL,    oi)
+                array.remove(shortSigState, oi)
+            else if hitTP3
+                label.new(bar_index, low, "✓  TP3 HIT\nMaximum Profit",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,0), textcolor=color.white,
+                     style=label.style_label_up, size=size.small)
+                array.remove(shortSigBars,  oi)
+                array.remove(shortSigEntry, oi)
+                array.remove(shortSigTP1,   oi)
+                array.remove(shortSigTP2,   oi)
+                array.remove(shortSigTP3,   oi)
+                array.remove(shortSigSL,    oi)
+                array.remove(shortSigState, oi)
+            else if hitTP2
+                label.new(bar_index, low, "✓  TP2 HIT\nRunning to TP3",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,20), textcolor=color.white,
+                     style=label.style_label_up, size=size.small)
+                array.set(shortSigState, oi, 2)
+            else if hitTP1
+                label.new(bar_index, low, "✓  TP1 HIT\nRunning to TP2",
+                     xloc=xloc.bar_index, yloc=yloc.price,
+                     color=color.new(color.green,40), textcolor=color.white,
+                     style=label.style_label_up, size=size.small)
+                array.set(shortSigState, oi, 1)
+        oi -= 1
+
+// ── Draw entry signal labels + lines ──
+if longSig
+    string tpTxt = tpLabelLines(sigLongTP1, sigLongTP2, sigLongTP3, 1)
+    label.new(bar_index, low,
+         text="▲  LONG ENTRY\nClosest Untapped Zone  |  Confirmed\n" +
+              "Entry : " + str.tostring(sigLongEntry, format.mintick) + "\n" +
+              "SL      : " + str.tostring(sigLongSL,  format.mintick) + "\n" +
+              tpTxt,
+         xloc=xloc.bar_index, yloc=yloc.belowbar,
+         color=color.new(color.green,10), textcolor=color.white,
+         style=label.style_label_up, size=size.normal)
+    line.new(bar_index, sigLongTP1, bar_index + tpLineExtend, sigLongTP1,
+         color=color.new(color.green,10), width=2, style=line.style_solid)
+    if not na(sigLongTP2)
+        line.new(bar_index, sigLongTP2, bar_index + tpLineExtend, sigLongTP2,
+             color=color.new(color.green,30), width=1, style=line.style_dashed)
+    if not na(sigLongTP3)
+        line.new(bar_index, sigLongTP3, bar_index + tpLineExtend, sigLongTP3,
+             color=color.new(color.green,50), width=1, style=line.style_dotted)
+    line.new(bar_index, sigLongSL, bar_index + tpLineExtend, sigLongSL,
+         color=color.new(color.red,30), width=1, style=line.style_dotted)
+    if showOutcome
+        array.push(longSigBars,  bar_index)
+        array.push(longSigEntry, sigLongEntry)
+        array.push(longSigTP1,   sigLongTP1)
+        array.push(longSigTP2,   sigLongTP2)
+        array.push(longSigTP3,   sigLongTP3)
+        array.push(longSigSL,    sigLongSL)
+        array.push(longSigState, 0)
+
+if shortSig
+    string tpTxt = tpLabelLines(sigShortTP1, sigShortTP2, sigShortTP3, -1)
+    label.new(bar_index, high,
+         text="▼  SHORT ENTRY\nClosest Untapped Zone  |  Confirmed\n" +
+              "Entry : " + str.tostring(sigShortEntry, format.mintick) + "\n" +
+              "SL      : " + str.tostring(sigShortSL,  format.mintick) + "\n" +
+              tpTxt,
+         xloc=xloc.bar_index, yloc=yloc.abovebar,
+         color=color.new(color.red,10), textcolor=color.white,
+         style=label.style_label_down, size=size.normal)
+    line.new(bar_index, sigShortTP1, bar_index + tpLineExtend, sigShortTP1,
+         color=color.new(color.green,10), width=2, style=line.style_solid)
+    if not na(sigShortTP2)
+        line.new(bar_index, sigShortTP2, bar_index + tpLineExtend, sigShortTP2,
+             color=color.new(color.green,30), width=1, style=line.style_dashed)
+    if not na(sigShortTP3)
+        line.new(bar_index, sigShortTP3, bar_index + tpLineExtend, sigShortTP3,
+             color=color.new(color.green,50), width=1, style=line.style_dotted)
+    line.new(bar_index, sigShortSL, bar_index + tpLineExtend, sigShortSL,
+         color=color.new(color.red,30), width=1, style=line.style_dotted)
+    if showOutcome
+        array.push(shortSigBars,  bar_index)
+        array.push(shortSigEntry, sigShortEntry)
+        array.push(shortSigTP1,   sigShortTP1)
+        array.push(shortSigTP2,   sigShortTP2)
+        array.push(shortSigTP3,   sigShortTP3)
+        array.push(shortSigSL,    sigShortSL)
+        array.push(shortSigState, 0)
+
+// ══════════════════════════════════════════════
+//  BACKGROUND TREND SHADE
+// ══════════════════════════════════════════════
+bgcolor(trend ==  1 ? color.new(color.green, 96) :
+        trend == -1 ? color.new(color.red,   96) :
+                      color.new(color.gray,  96),
+        title="Trend Background Shade")
+
+// ══════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════
+alertcondition(longSig,  title="Long Entry",  message="FARUEXEE LONG entry signal")
+alertcondition(shortSig, title="Short Entry", message="FARUEXEE SHORT entry signal")

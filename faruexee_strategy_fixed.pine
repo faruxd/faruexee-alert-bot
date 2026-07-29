@@ -1,0 +1,527 @@
+// ============================================================
+// FARUEXEE Strategy — BACKTEST VERSION (all fixes A–J applied)
+// Pine Script v6  |  Tuned for 1H / 4H  |  Pure Price Action
+// Use TradingView's Strategy Tester to measure winrate / RR / DD
+// ============================================================
+//@version=6
+strategy("FARUEXEE Strategy [Backtest]",
+     overlay              = true,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 100,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.05,        // 0.05% per side (typical crypto taker)
+     slippage             = 2,
+     pyramiding           = 0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     max_boxes_count      = 500,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ══════════════════════════════════════════════
+//  RISK SIZING
+// ══════════════════════════════════════════════
+grpSize       = "── Position Sizing ──"
+riskPct       = input.float(1.0, "Risk per trade (% of equity)", minval=0.1, maxval=10, step=0.1, group=grpSize,
+     tooltip="Position size auto-calculated so that an SL hit loses this % of equity.")
+tp1Portion    = input.float(40, "TP1 close %", minval=0, maxval=100, group=grpSize)
+tp2Portion    = input.float(35, "TP2 close %", minval=0, maxval=100, group=grpSize)
+moveSLToBE    = input.bool(true, "Move SL to break-even after TP1", group=grpSize)
+
+// ══════════════════════════════════════════════
+//  SETTINGS — Market Structure
+// ══════════════════════════════════════════════
+grpStruct      = "── Market Structure ──"
+lookback       = input.int(20, "Swing Lookback (bars)", minval=5, maxval=100, group=grpStruct)
+trendStability = input.int(2, "Trend Flip Stability (opposing pivots needed)", minval=1, maxval=5, group=grpStruct)
+
+// ══════════════════════════════════════════════
+//  HTF Bias (Fix F)
+// ══════════════════════════════════════════════
+grpHTF        = "── HTF Bias Filter ──"
+useHTF        = input.bool(true,  "Require HTF trend agreement", group=grpHTF)
+htfTimeframe  = input.timeframe("240", "HTF Timeframe", group=grpHTF)
+
+// ══════════════════════════════════════════════
+//  Zones
+// ══════════════════════════════════════════════
+grpZones         = "── Zones ──"
+showZones        = input.bool(true, "Show Zones on chart", group=grpZones)
+rightExtend      = input.int(50, "Extend Zones Right (bars)", minval=10, maxval=300, group=grpZones)
+impulseStrength  = input.float(1.5, "Impulse Strength (× avg body)", minval=1.0, step=0.1, group=grpZones)
+useBaseCandle    = input.bool(true, "Use Base Candle as Zone (Fix I)", group=grpZones)
+requireVolume    = input.bool(true, "Require Volume Confirmation (Fix J)", group=grpZones)
+volumeMult       = input.float(1.5, "Volume Multiplier", minval=1.0, step=0.1, group=grpZones)
+fireOnSecondTest = input.bool(true, "Fire on 2nd Test, not 1st (Fix G)", group=grpZones)
+
+// ══════════════════════════════════════════════
+//  Risk
+// ══════════════════════════════════════════════
+grpRisk      = "── Risk ──"
+useATRSL     = input.bool(true,  "ATR-based SL (Fix E)", group=grpRisk)
+atrLen       = input.int(14, "ATR Length", minval=2, group=grpRisk)
+atrMult      = input.float(0.5, "ATR SL Multiplier", minval=0.1, step=0.1, group=grpRisk)
+slBuffer     = input.float(0.1, "Fallback SL Buffer (× zone height)", minval=0.0, step=0.05, group=grpRisk)
+minRR        = input.float(1.5, "Minimum RR for TP1 (Fix D)", minval=0.5, step=0.1, group=grpRisk)
+tpMulti      = input.float(2.0, "TP Fallback Multiplier", minval=0.5, step=0.5, group=grpRisk)
+
+// ══════════════════════════════════════════════
+//  FVG filter (Fix B)
+// ══════════════════════════════════════════════
+grpFvg         = "── FVG Filter ──"
+useFvgFilter   = input.bool(true, "Block entries inside recent FVG", group=grpFvg)
+fvgRecentBars  = input.int(100, "FVG Recency Window (bars)", minval=10, group=grpFvg)
+
+// ══════════════════════════════════════════════
+//  Date range (for clean backtests)
+// ══════════════════════════════════════════════
+grpDate     = "── Backtest Date Range ──"
+useDateFilt = input.bool(false, "Limit by date", group=grpDate)
+startDate   = input.time(timestamp("2023-01-01 00:00"), "Start", group=grpDate)
+endDate     = input.time(timestamp("2026-12-31 00:00"), "End",   group=grpDate)
+inDateRange = not useDateFilt or (time >= startDate and time <= endDate)
+
+// ══════════════════════════════════════════════
+//  SWING PIVOTS
+// ══════════════════════════════════════════════
+swingH = ta.pivothigh(high, lookback, lookback)
+swingL = ta.pivotlow (low,  lookback, lookback)
+
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+
+if not na(swingH)
+    ph2 := ph1
+    ph1 := swingH
+if not na(swingL)
+    pl2 := pl1
+    pl1 := swingL
+
+isHH = not na(swingH) and not na(ph2) and swingH > ph2
+isLH = not na(swingH) and not na(ph2) and swingH < ph2
+isHL = not na(swingL) and not na(pl2) and swingL > pl2
+isLL = not na(swingL) and not na(pl2) and swingL < pl2
+
+// ══════════════════════════════════════════════
+//  TREND STATE — Fix H
+// ══════════════════════════════════════════════
+var int trend           = 0
+var int bullSignalCount = 0
+var int bearSignalCount = 0
+
+if isHH or isHL
+    bullSignalCount := bullSignalCount + 1
+    bearSignalCount := 0
+if isLH or isLL
+    bearSignalCount := bearSignalCount + 1
+    bullSignalCount := 0
+
+if bullSignalCount >= trendStability and trend != 1
+    trend := 1
+if bearSignalCount >= trendStability and trend != -1
+    trend := -1
+
+htfTrendRaw = request.security(syminfo.tickerid, htfTimeframe, trend, lookahead=barmerge.lookahead_off)
+int htfTrend = na(htfTrendRaw) ? 0 : int(htfTrendRaw)
+
+// ══════════════════════════════════════════════
+//  IMPULSE — Fix C + J
+// ══════════════════════════════════════════════
+float avgBody     = ta.sma(math.abs(close - open), 20)[1]
+float volSma      = ta.sma(volume, 20)[1]
+bool  volOK       = not requireVolume or volume >= volSma * volumeMult
+bool  bullImpulse = close > open and (close - open) >= avgBody * impulseStrength and volOK
+bool  bearImpulse = close < open and (open - close) >= avgBody * impulseStrength and volOK
+bool  bullGap     = low  > high[2]
+bool  bearGap     = high < low[2]
+float atrVal      = ta.atr(atrLen)
+
+// ══════════════════════════════════════════════
+//  ZONE ARRAYS — Demand
+// ══════════════════════════════════════════════
+var box[]   demandBoxes   = array.new<box>()
+var float[] demandTops    = array.new<float>()
+var float[] demandBots    = array.new<float>()
+var int[]   demandCreated = array.new<int>()
+var int[]   demandTaps    = array.new<int>()
+var bool[]  demandWasIn   = array.new<bool>()
+
+// Supply
+var box[]   supplyBoxes   = array.new<box>()
+var float[] supplyTops    = array.new<float>()
+var float[] supplyBots    = array.new<float>()
+var int[]   supplyCreated = array.new<int>()
+var int[]   supplyTaps    = array.new<int>()
+var bool[]  supplyWasIn   = array.new<bool>()
+
+// FVG
+var float[] bullImbTops    = array.new<float>()
+var float[] bullImbBots    = array.new<float>()
+var int[]   bullImbCreated = array.new<int>()
+var float[] bearImbTops    = array.new<float>()
+var float[] bearImbBots    = array.new<float>()
+var int[]   bearImbCreated = array.new<int>()
+
+// ══════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════
+calcLongSL(zTop, zBot) =>
+    useATRSL ? zBot - atrVal * atrMult : zBot - (zTop - zBot) * slBuffer
+
+calcShortSL(zTop, zBot) =>
+    useATRSL ? zTop + atrVal * atrMult : zTop + (zTop - zBot) * slBuffer
+
+findLongTPs(entryPrice, slPrice) =>
+    float[] cands = array.new<float>()
+    if array.size(supplyBoxes) > 0
+        for k = 0 to array.size(supplyBoxes) - 1
+            float zBot = array.get(supplyBots, k)
+            if zBot > entryPrice
+                array.push(cands, zBot)
+    array.sort(cands, order.ascending)
+    float tp1 = array.size(cands) >= 1 ? array.get(cands, 0) : entryPrice + (entryPrice - slPrice) * tpMulti
+    float tp2 = array.size(cands) >= 2 ? array.get(cands, 1) : na
+    float tp3 = array.size(cands) >= 3 ? array.get(cands, 2) : na
+    [tp1, tp2, tp3]
+
+findShortTPs(entryPrice, slPrice) =>
+    float[] cands = array.new<float>()
+    if array.size(demandBoxes) > 0
+        for k = 0 to array.size(demandBoxes) - 1
+            float zTop = array.get(demandTops, k)
+            if zTop < entryPrice
+                array.push(cands, zTop)
+    array.sort(cands, order.descending)
+    float tp1 = array.size(cands) >= 1 ? array.get(cands, 0) : entryPrice - (slPrice - entryPrice) * tpMulti
+    float tp2 = array.size(cands) >= 2 ? array.get(cands, 1) : na
+    float tp3 = array.size(cands) >= 3 ? array.get(cands, 2) : na
+    [tp1, tp2, tp3]
+
+buildBullZone() =>
+    float zTop = na
+    float zBot = na
+    if useBaseCandle
+        for j = 2 to 6
+            if close[j] <= open[j]
+                zTop := high[j]
+                zBot := low[j]
+                break
+        if na(zTop)
+            zTop := high[1]
+            zBot := low[1]
+    else
+        zTop := high[1]
+        zBot := low[1]
+    [zTop, zBot]
+
+buildBearZone() =>
+    float zTop = na
+    float zBot = na
+    if useBaseCandle
+        for j = 2 to 6
+            if close[j] >= open[j]
+                zTop := high[j]
+                zBot := low[j]
+                break
+        if na(zTop)
+            zTop := high[1]
+            zBot := low[1]
+    else
+        zTop := high[1]
+        zBot := low[1]
+    [zTop, zBot]
+
+// ══════════════════════════════════════════════
+//  FVG NEAR-PRICE CHECK — Fix B
+// ══════════════════════════════════════════════
+bool insideAnyFVG = false
+if useFvgFilter
+    if array.size(bullImbTops) > 0
+        for k = 0 to array.size(bullImbTops) - 1
+            if bar_index - array.get(bullImbCreated, k) < fvgRecentBars
+                if close >= array.get(bullImbBots, k) and close <= array.get(bullImbTops, k)
+                    insideAnyFVG := true
+    if array.size(bearImbTops) > 0
+        for k = 0 to array.size(bearImbTops) - 1
+            if bar_index - array.get(bearImbCreated, k) < fvgRecentBars
+                if close >= array.get(bearImbBots, k) and close <= array.get(bearImbTops, k)
+                    insideAnyFVG := true
+
+// ══════════════════════════════════════════════
+//  ZONE TAP MAINTENANCE — Fix G
+// ══════════════════════════════════════════════
+if array.size(demandBoxes) > 0
+    int di = array.size(demandBoxes) - 1
+    while di >= 0
+        float zTop   = array.get(demandTops,   di)
+        int   crated = array.get(demandCreated, di)
+        bool  wasIn  = array.get(demandWasIn,   di)
+        int   taps   = array.get(demandTaps,    di)
+        bool  isIn   = bar_index > crated and low <= zTop
+        bool  newTap = isIn and not wasIn
+        array.set(demandWasIn, di, isIn)
+        if newTap
+            int newTaps = taps + 1
+            bool deleteNow = fireOnSecondTest ? newTaps >= 2 : newTaps >= 1
+            if deleteNow
+                if showZones
+                    box.delete(array.get(demandBoxes, di))
+                array.remove(demandBoxes,   di)
+                array.remove(demandTops,    di)
+                array.remove(demandBots,    di)
+                array.remove(demandCreated, di)
+                array.remove(demandTaps,    di)
+                array.remove(demandWasIn,   di)
+            else
+                array.set(demandTaps, di, newTaps)
+        di -= 1
+
+if array.size(supplyBoxes) > 0
+    int si = array.size(supplyBoxes) - 1
+    while si >= 0
+        float zBot   = array.get(supplyBots,   si)
+        int   crated = array.get(supplyCreated, si)
+        bool  wasIn  = array.get(supplyWasIn,   si)
+        int   taps   = array.get(supplyTaps,    si)
+        bool  isIn   = bar_index > crated and high >= zBot
+        bool  newTap = isIn and not wasIn
+        array.set(supplyWasIn, si, isIn)
+        if newTap
+            int newTaps = taps + 1
+            bool deleteNow = fireOnSecondTest ? newTaps >= 2 : newTaps >= 1
+            if deleteNow
+                if showZones
+                    box.delete(array.get(supplyBoxes, si))
+                array.remove(supplyBoxes,   si)
+                array.remove(supplyTops,    si)
+                array.remove(supplyBots,    si)
+                array.remove(supplyCreated, si)
+                array.remove(supplyTaps,    si)
+                array.remove(supplyWasIn,   si)
+            else
+                array.set(supplyTaps, si, newTaps)
+        si -= 1
+
+// ══════════════════════════════════════════════
+//  ZONE CREATE — Fix I
+// ══════════════════════════════════════════════
+int rEdge = bar_index + rightExtend
+
+if bullImpulse and trend == 1 and bullGap
+    [zTop, zBot] = buildBullZone()
+    float minHeight = atrVal * 0.05
+    if not na(zTop) and not na(zBot) and (zTop - zBot) > minHeight
+        if showZones
+            box.new(bar_index[1], zTop, rEdge, zBot,
+                 bgcolor=color.new(color.green, 75),
+                 border_color=color.new(color.lime, 10), border_width=2)
+        array.push(demandBoxes,   na)  // placeholder if not showing
+        array.push(demandTops,    zTop)
+        array.push(demandBots,    zBot)
+        array.push(demandCreated, bar_index)
+        array.push(demandTaps,    0)
+        array.push(demandWasIn,   false)
+
+if bearImpulse and trend == -1 and bearGap
+    [zTop, zBot] = buildBearZone()
+    float minHeight = atrVal * 0.05
+    if not na(zTop) and not na(zBot) and (zTop - zBot) > minHeight
+        if showZones
+            box.new(bar_index[1], zTop, rEdge, zBot,
+                 bgcolor=color.new(color.red, 75),
+                 border_color=color.new(color.red, 10), border_width=2)
+        array.push(supplyBoxes,   na)
+        array.push(supplyTops,    zTop)
+        array.push(supplyBots,    zBot)
+        array.push(supplyCreated, bar_index)
+        array.push(supplyTaps,    0)
+        array.push(supplyWasIn,   false)
+
+// ══════════════════════════════════════════════
+//  FVG TRACKING (for the filter)
+// ══════════════════════════════════════════════
+// Delete tapped FVGs
+if array.size(bullImbTops) > 0
+    int bi = array.size(bullImbTops) - 1
+    while bi >= 0
+        if bar_index > array.get(bullImbCreated, bi) and low <= array.get(bullImbTops, bi)
+            array.remove(bullImbTops,    bi)
+            array.remove(bullImbBots,    bi)
+            array.remove(bullImbCreated, bi)
+        bi -= 1
+if array.size(bearImbTops) > 0
+    int bri = array.size(bearImbTops) - 1
+    while bri >= 0
+        if bar_index > array.get(bearImbCreated, bri) and high >= array.get(bearImbBots, bri)
+            array.remove(bearImbTops,    bri)
+            array.remove(bearImbBots,    bri)
+            array.remove(bearImbCreated, bri)
+        bri -= 1
+
+bool bullImb = low  > high[2]
+bool bearImb = high < low[2]
+if bullImb
+    float gapBot = high[2]
+    float gapTop = low
+    if gapTop > gapBot
+        array.push(bullImbTops,    gapTop)
+        array.push(bullImbBots,    gapBot)
+        array.push(bullImbCreated, bar_index)
+if bearImb
+    float gapBot = high
+    float gapTop = low[2]
+    if gapTop > gapBot
+        array.push(bearImbTops,    gapTop)
+        array.push(bearImbBots,    gapBot)
+        array.push(bearImbCreated, bar_index)
+
+// ══════════════════════════════════════════════
+//  ENTRY DECISION — Fix A + D + F + G
+// ══════════════════════════════════════════════
+bool htfBullOK = not useHTF or htfTrend == 1
+bool htfBearOK = not useHTF or htfTrend == -1
+
+float longEntry = na
+float longSL    = na
+float longTP1   = na
+float longTP2   = na
+float longTP3   = na
+bool  doLong    = false
+
+if inDateRange and trend == 1 and htfBullOK and not insideAnyFVG and array.size(demandBoxes) > 0
+    float bestTop = na
+    float bestBot = na
+    for k = 0 to array.size(demandBoxes) - 1
+        float zTop   = array.get(demandTops,    k)
+        float zBot   = array.get(demandBots,    k)
+        int   crated = array.get(demandCreated, k)
+        int   taps   = array.get(demandTaps,    k)
+        bool  qualifies = bar_index > crated and zTop < close
+        qualifies := qualifies and (fireOnSecondTest ? taps == 1 : taps == 0)
+        if qualifies
+            if na(bestTop) or zTop > bestTop
+                bestTop := zTop
+                bestBot := zBot
+    if not na(bestTop) and low <= bestTop and close > bestTop
+        float sl       = calcLongSL(bestTop, bestBot)
+        [t1, t2, t3]   = findLongTPs(bestTop, sl)
+        float rr       = (bestTop - sl) > 0 ? (t1 - bestTop) / (bestTop - sl) : 0
+        if rr >= minRR
+            doLong    := true
+            longEntry := bestTop
+            longSL    := sl
+            longTP1   := t1
+            longTP2   := t2
+            longTP3   := t3
+
+float shortEntry = na
+float shortSL    = na
+float shortTP1   = na
+float shortTP2   = na
+float shortTP3   = na
+bool  doShort    = false
+
+if inDateRange and trend == -1 and htfBearOK and not insideAnyFVG and array.size(supplyBoxes) > 0
+    float bestBot2 = na
+    float bestTop2 = na
+    for k = 0 to array.size(supplyBoxes) - 1
+        float zTop   = array.get(supplyTops,    k)
+        float zBot   = array.get(supplyBots,    k)
+        int   crated = array.get(supplyCreated, k)
+        int   taps   = array.get(supplyTaps,    k)
+        bool  qualifies = bar_index > crated and zBot > close
+        qualifies := qualifies and (fireOnSecondTest ? taps == 1 : taps == 0)
+        if qualifies
+            if na(bestBot2) or zBot < bestBot2
+                bestBot2 := zBot
+                bestTop2 := zTop
+    if not na(bestBot2) and high >= bestBot2 and close < bestBot2
+        float sl       = calcShortSL(bestTop2, bestBot2)
+        [t1, t2, t3]   = findShortTPs(bestBot2, sl)
+        float rr       = (sl - bestBot2) > 0 ? (bestBot2 - t1) / (sl - bestBot2) : 0
+        if rr >= minRR
+            doShort    := true
+            shortEntry := bestBot2
+            shortSL    := sl
+            shortTP1   := t1
+            shortTP2   := t2
+            shortTP3   := t3
+
+// ══════════════════════════════════════════════
+//  STRATEGY EXECUTION
+// ══════════════════════════════════════════════
+// Position-size by risk: qty so that (entry - SL) * qty = equity * riskPct%
+calcQty(entryPx, slPx) =>
+    float riskPerUnit = math.abs(entryPx - slPx)
+    float dollarRisk  = strategy.equity * (riskPct / 100.0)
+    riskPerUnit > 0 ? dollarRisk / riskPerUnit : 0
+
+// Track the active trade so we can scale out and BE
+var float curSL  = na
+var float curTP1 = na
+var float curTP2 = na
+var float curTP3 = na
+var bool  tp1Filled = false
+
+if doLong and strategy.position_size == 0
+    float qty = calcQty(longEntry, longSL)
+    strategy.entry("L", strategy.long, qty=qty)
+    curSL    := longSL
+    curTP1   := longTP1
+    curTP2   := longTP2
+    curTP3   := longTP3
+    tp1Filled := false
+
+if doShort and strategy.position_size == 0
+    float qty = calcQty(shortEntry, shortSL)
+    strategy.entry("S", strategy.short, qty=qty)
+    curSL    := shortSL
+    curTP1   := shortTP1
+    curTP2   := shortTP2
+    curTP3   := shortTP3
+    tp1Filled := false
+
+// Manage open position
+if strategy.position_size > 0
+    // Long management
+    float p1 = math.round(strategy.position_size * tp1Portion / 100.0)
+    float p2 = math.round(strategy.position_size * tp2Portion / 100.0)
+    strategy.exit("TP1", from_entry="L", qty=p1, limit=curTP1, stop=curSL)
+    if not na(curTP2)
+        strategy.exit("TP2", from_entry="L", qty=p2, limit=curTP2, stop=curSL)
+    strategy.exit("TP3", from_entry="L", limit=na(curTP3) ? curTP1 * 2 : curTP3, stop=curSL)
+    // Move SL to BE after TP1 hit
+    if moveSLToBE and not tp1Filled and high >= curTP1
+        curSL := strategy.position_avg_price
+        tp1Filled := true
+
+if strategy.position_size < 0
+    float absSize = math.abs(strategy.position_size)
+    float p1 = math.round(absSize * tp1Portion / 100.0)
+    float p2 = math.round(absSize * tp2Portion / 100.0)
+    strategy.exit("TP1", from_entry="S", qty=p1, limit=curTP1, stop=curSL)
+    if not na(curTP2)
+        strategy.exit("TP2", from_entry="S", qty=p2, limit=curTP2, stop=curSL)
+    strategy.exit("TP3", from_entry="S", limit=na(curTP3) ? curTP1 * 0.5 : curTP3, stop=curSL)
+    if moveSLToBE and not tp1Filled and low <= curTP1
+        curSL := strategy.position_avg_price
+        tp1Filled := true
+
+// Reset trackers when flat
+if strategy.position_size == 0
+    curSL    := na
+    curTP1   := na
+    curTP2   := na
+    curTP3   := na
+    tp1Filled := false
+
+// ══════════════════════════════════════════════
+//  VISUAL: trend background
+// ══════════════════════════════════════════════
+bgcolor(trend ==  1 ? color.new(color.green, 96) :
+        trend == -1 ? color.new(color.red,   96) :
+                      color.new(color.gray,  96),
+        title="Trend Shade")
