@@ -95,7 +95,7 @@ services:
       - key: MIN_EQUITY_FRACTION
         value: "0.70"
       - key: MIN_EQUITY_USDT
-        value: "50"
+        value: "20"
       - key: LEVERAGE
         value: "10"
       - key: MARGIN_MODE

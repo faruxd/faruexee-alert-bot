@@ -120,7 +120,12 @@ MAX_MARGIN_FRACTION = _f("MAX_MARGIN_FRACTION", 0.30)
 MAX_ENTRY_DISTANCE = _f("MAX_ENTRY_DISTANCE", 0.05)   # 5%
 
 # Minimum account equity required to operate at all.
-MIN_EQUITY_USDT    = _f("MIN_EQUITY_USDT", 50.0)
+#
+# This only gates startup. It does not lower the exchange's own order
+# minimums — on a small account those, plus MAX_NOTIONAL_X_EQUITY, are
+# what actually decide whether a signal is tradeable. Expect some setups
+# to be skipped or size-capped below the full risk budget.
+MIN_EQUITY_USDT    = _f("MIN_EQUITY_USDT", 20.0)
 
 # Simulated equity used when dry-running without API credentials, so the
 # whole bot can be exercised end to end before any key exists.
