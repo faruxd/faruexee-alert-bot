@@ -124,7 +124,11 @@ class BitgetClient:
                 if attempt < retries:
                     time.sleep(2.0 * (attempt + 1))
                     continue
-            raise BitgetError(f"{msg} (code {code}) on {path}", code=code, endpoint=path)
+            # Include the request body on rejection. Without it a business
+            # error like "parameter verification failed" is undiagnosable.
+            detail = f" sent={body_str}" if body_str else ""
+            raise BitgetError(f"{msg} (code {code}) on {path}{detail}",
+                              code=code, endpoint=path)
 
         raise last_err or BitgetError("request failed", endpoint=path)
 

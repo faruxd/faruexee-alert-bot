@@ -164,6 +164,12 @@ BE_OFFSET_R        = _f("BE_OFFSET_R", 0.05)
 
 TRIGGER_TYPE       = os.environ.get("TRIGGER_TYPE", "mark_price")  # mark_price | fill_price
 
+# How many cycles to keep retrying a failed take-profit ladder before
+# giving up and escalating to the operator. Retrying forever spams the
+# channel every cycle and risks duplicating targets if the operator
+# places them by hand in the meantime.
+TP_MAX_RETRIES     = _i("TP_MAX_RETRIES", 5)
+
 
 # =============================================================
 #   STRATEGY  (passed into faruexee_engine.EngineConfig)

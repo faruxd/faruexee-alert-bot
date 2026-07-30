@@ -673,13 +673,42 @@ class TradeBot:
         pos["tps_placed"] = ok_count > 0 or not self.live
 
         if failures and self.live:
-            notify(f"Take-profit placement problem — {sym}", [
-                f"{ok_count} of {len(active)} targets placed.",
-                *failures,
-                "",
-                "The stop loss is on the exchange and unaffected.",
-                "The bot will retry the missing targets next cycle.",
-            ], ORANGE)
+            attempts = pos.get("tp_attempts", 0) + 1
+            pos["tp_attempts"] = attempts
+            pos["tp_last_error"] = failures[0]
+
+            if attempts >= C.TP_MAX_RETRIES:
+                # Stop retrying. Repeating every cycle floods the channel
+                # and risks duplicating targets if the operator has since
+                # placed them by hand. Escalate once, clearly, and stop.
+                pos["tps_placed"] = True
+                pos["tp_gave_up"] = True
+                log(f"[ERROR] {sym}: giving up on take-profit ladder after "
+                    f"{attempts} attempts — manual action needed")
+                notify(f"ACTION NEEDED — no take-profit on {sym}", [
+                    f"Take-profit placement failed {attempts} times. "
+                    f"The bot has stopped retrying.",
+                    "",
+                    f"**Set the targets manually on Bitget.**",
+                    f"Position: `{pos.get('orig_size')}` from `{pos.get('entry')}`",
+                    f"TP1 `{pos.get('tp1')}`"
+                    + (f"  TP2 `{pos.get('tp2')}`" if pos.get("tp2") else "")
+                    + (f"  TP3 `{pos.get('tp3')}`" if pos.get("tp3") else ""),
+                    "",
+                    f"Last error: `{failures[0]}`",
+                    "",
+                    "The stop loss **is** on the exchange and still protects "
+                    "this position. Only automatic profit-taking is missing.",
+                ], RED)
+            elif attempts == 1:
+                # Report the first failure only; the retries are silent.
+                notify(f"Take-profit placement problem — {sym}", [
+                    f"{ok_count} of {len(active)} targets placed.",
+                    *failures,
+                    "",
+                    "The stop loss is on the exchange and unaffected.",
+                    f"Retrying — will escalate after {C.TP_MAX_RETRIES} attempts.",
+                ], ORANGE)
 
         return ok_count
 
