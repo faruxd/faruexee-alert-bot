@@ -21,7 +21,7 @@ os.environ.setdefault("TRADE_STATE_FILE", os.path.join(tempfile.gettempdir(), "t
 os.environ.setdefault("TRADE_JOURNAL_FILE", os.path.join(tempfile.gettempdir(), "t_journal.csv"))
 
 import trade_config as C
-from bitget_client import BitgetClient
+from bitget_client import BitgetClient, BitgetError
 from faruexee_engine import (
     EngineConfig, analyze, calc_ema, compute_htf_bias, htf_agrees, tradeable_zones,
 )
@@ -434,6 +434,80 @@ def test_size_units():
           c.units_to_size("XRPUSDT", 37))
 
 
+def test_hold_side():
+    """
+    Regression: Bitget's position endpoint reports holdSide as "buy"/"sell"
+    in one-way mode, but the TPSL endpoints only accept "long"/"short" and
+    reject anything else with code 43011. _on_fill trusted the position
+    value verbatim, so every take-profit was rejected while the entry and
+    its attached stop went through — a live position with no targets.
+    """
+    print("\nPosition side normalisation")
+    c = fake_client()
+
+    check("long stays long", c.norm_hold_side("long") == "long")
+    check("short stays short", c.norm_hold_side("short") == "short")
+    check("buy maps to long", c.norm_hold_side("buy") == "long")
+    check("sell maps to short", c.norm_hold_side("sell") == "short")
+    check("case and spacing tolerated", c.norm_hold_side(" SELL ") == "short")
+    check("empty falls back", c.norm_hold_side("", fallback="short") == "short")
+    check("None falls back", c.norm_hold_side(None, fallback="buy") == "long")
+
+    try:
+        c.norm_hold_side("sideways")
+        check("garbage raises rather than sending a bad order", False)
+    except BitgetError:
+        check("garbage raises rather than sending a bad order", True)
+
+    # The TPSL payload must never carry buy/sell.
+    sent = {}
+
+    class CaptureClient(BitgetClient):
+        def __init__(self):
+            super().__init__("", "", "")
+            self._specs = dict(FAKE_SPECS)
+
+        def _request(self, method, path, params=None, body=None, **kw):
+            sent[path] = body
+            return {}
+
+    cc = CaptureClient()
+    cc.place_partial_tp("SOLUSDT", "sell", 0.2, 73.7)
+    payload = sent.get("/api/v2/mix/order/place-tpsl-order", {})
+    check("partial TP sends long/short, never buy/sell",
+          payload.get("holdSide") == "short", payload.get("holdSide"))
+
+    sent.clear()
+    cc.set_position_stop("SOLUSDT", "buy", 76.3)
+    payload = sent.get("/api/v2/mix/order/place-tpsl-order", {})
+    check("break-even stop sends long/short too",
+          payload.get("holdSide") == "long", payload.get("holdSide"))
+
+    # And the whole fill path, end to end.
+    import faruexee_trade_bot as T
+    bot = T.TradeBot.__new__(T.TradeBot)
+    bot.cfg = EngineConfig()
+    bot.client = fake_client()
+    bot.live = False
+    bot.offline = True
+    bot.equity = 1000.0
+    bot.state = {"orders": {}, "positions": {},
+                 "daily": {"date": T.utc_date(), "start_equity": 1000.0},
+                 "halted": False, "halt_reason": "", "baseline_equity": 1000.0}
+    rec = {"symbol": "SOLUSDT", "timeframe": "1H", "zone_id": "z",
+           "side": "sell", "entry": 75.4, "sl": 76.3, "tp1": 73.7,
+           "tp2": None, "tp3": None, "rr": 2.0, "size": 0.4,
+           "risk_usdt": 0.35, "placed_at": T.now_iso()}
+    import io
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        bot._on_fill("o1", rec,
+                     {"symbol": "SOLUSDT", "holdSide": "sell", "total": "0.4"})
+    check("_on_fill stores a normalised side",
+          bot.state["positions"]["SOLUSDT"]["hold_side"] == "short",
+          bot.state["positions"]["SOLUSDT"]["hold_side"])
+
+
 def test_tp_ladder():
     print("\nTake-profit ladder")
     bot = make_bot(1000.0)
@@ -484,6 +558,7 @@ if __name__ == "__main__":
     test_geometry()
     test_engine()
     test_size_units()
+    test_hold_side()
     test_tp_coverage()
     test_tp_ladder()
     test_config()

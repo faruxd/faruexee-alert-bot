@@ -546,7 +546,13 @@ class TradeBot:
         entry_px = rec["entry"]
 
         if live_pos:
-            hold_side = live_pos.get("holdSide") or hold_side
+            # Normalise, do not trust verbatim. In one-way mode the position
+            # endpoint reports holdSide as "buy"/"sell", but the TPSL
+            # endpoints only accept "long"/"short" and reject the rest with
+            # code 43011 — which is exactly how take-profits silently failed
+            # while the entry and its attached stop went through fine.
+            hold_side = self.client.norm_hold_side(
+                live_pos.get("holdSide"), fallback=hold_side)
             try:
                 actual = float(live_pos.get("total", 0) or 0)
                 if actual > 0:

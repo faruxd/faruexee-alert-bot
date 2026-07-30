@@ -430,7 +430,7 @@ class BitgetClient:
 
     def close_position_market(self, symbol, hold_side, size):
         """Emergency / manual exit — reduce-only market order."""
-        side = "sell" if hold_side == "long" else "buy"
+        side = "sell" if self.norm_hold_side(hold_side) == "long" else "buy"
         body = {
             "symbol": symbol,
             "productType": self.product_type,
@@ -447,6 +447,26 @@ class BitgetClient:
     #   TP / SL PLAN ORDERS
     # ---------------------------------------------------------
 
+    @staticmethod
+    def norm_hold_side(value, fallback=None):
+        """
+        Normalise a position direction to what the TPSL endpoints expect.
+
+        Bitget is inconsistent across endpoints: in one-way mode the
+        position endpoint reports holdSide as "buy"/"sell", while the
+        TPSL endpoints only accept "long"/"short" and reject anything
+        else with code 43011. Everything funnels through here so a value
+        read from one endpoint can be handed to the other safely.
+        """
+        v = str(value or "").strip().lower()
+        if v in ("long", "buy"):
+            return "long"
+        if v in ("short", "sell"):
+            return "short"
+        if fallback:
+            return BitgetClient.norm_hold_side(fallback)
+        raise BitgetError(f"cannot interpret position side {value!r}")
+
     def place_partial_tp(self, symbol, hold_side, size, trigger_price,
                          client_oid=None, trigger_type="mark_price"):
         """Partial take-profit — closes `size` of the position at trigger."""
@@ -458,7 +478,7 @@ class BitgetClient:
             "triggerPrice": str(trigger_price),
             "triggerType": trigger_type,
             "executePrice": "0",          # 0 = market execution on trigger
-            "holdSide": hold_side,        # "long" | "short"
+            "holdSide": self.norm_hold_side(hold_side),
             "size": str(size),
         }
         if client_oid:
@@ -479,7 +499,7 @@ class BitgetClient:
             "triggerPrice": str(trigger_price),
             "triggerType": trigger_type,
             "executePrice": "0",
-            "holdSide": hold_side,
+            "holdSide": self.norm_hold_side(hold_side),
         }
         if client_oid:
             body["clientOid"] = client_oid
