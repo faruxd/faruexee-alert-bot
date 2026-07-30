@@ -170,6 +170,16 @@ TRIGGER_TYPE       = os.environ.get("TRIGGER_TYPE", "mark_price")  # mark_price 
 # places them by hand in the meantime.
 TP_MAX_RETRIES     = _i("TP_MAX_RETRIES", 5)
 
+# After the exchange rejects an entry, wait this long before trying that
+# symbol again. Without it a rejection repeats every cycle forever:
+# same order, same refusal, same alert.
+REJECT_COOLDOWN_MIN = _f("REJECT_COOLDOWN_MIN", 30.0)
+
+# Leave this much of the margin budget unspent to cover fees and the
+# exchange's own open-cost buffer. Sizing to the exact limit gets
+# rejected for being a few cents over.
+MARGIN_SAFETY       = _f("MARGIN_SAFETY", 0.90)
+
 
 # =============================================================
 #   STRATEGY  (passed into faruexee_engine.EngineConfig)

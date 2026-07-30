@@ -174,7 +174,26 @@ class TradeBot:
         s.setdefault("halted", False)
         s.setdefault("halt_reason", "")
         s.setdefault("baseline_equity", None)
+        s.setdefault("cooldowns", {})
         return s
+
+    def _cooldown_active(self, symbol):
+        until = self.state.get("cooldowns", {}).get(symbol)
+        if not until:
+            return False
+        try:
+            if datetime.now(timezone.utc) < datetime.fromisoformat(until):
+                return True
+        except (TypeError, ValueError):
+            pass
+        self.state.get("cooldowns", {}).pop(symbol, None)
+        return False
+
+    def _start_cooldown(self, symbol, reason):
+        from datetime import timedelta
+        until = datetime.now(timezone.utc) + timedelta(minutes=C.REJECT_COOLDOWN_MIN)
+        self.state.setdefault("cooldowns", {})[symbol] = until.isoformat()
+        log(f"{symbol}: cooling down for {C.REJECT_COOLDOWN_MIN:.0f}m — {reason}")
 
     def _save_state(self):
         tmp = C.STATE_FILE + ".tmp"
@@ -883,11 +902,14 @@ class TradeBot:
             raw = max_notional / entry
             note = f"size capped by MAX_NOTIONAL_X_EQUITY ({C.MAX_NOTIONAL_X_EQUITY}x)"
 
-        margin_budget = available * C.MAX_MARGIN_FRACTION
+        # MARGIN_SAFETY leaves headroom for fees and the exchange's
+        # open-cost buffer; sizing to the exact limit gets rejected.
+        margin_budget = available * C.MAX_MARGIN_FRACTION * C.MARGIN_SAFETY
         max_by_margin = (margin_budget * C.LEVERAGE) / entry
         if raw > max_by_margin:
             raw = max_by_margin
-            note = f"size capped by free margin ({C.MAX_MARGIN_FRACTION:.0%})"
+            note = (f"size capped by free margin "
+                    f"({C.MAX_MARGIN_FRACTION:.0%} of {available:.2f})")
 
         size = self.client.round_size(symbol, raw)
         if size <= 0:
@@ -912,6 +934,8 @@ class TradeBot:
         if self.symbol_busy(symbol):
             return False
         if self.zone_already_ordered(zone.zone_id):
+            return False
+        if self._cooldown_active(symbol):
             return False
 
         entry = self.client.round_price(
@@ -988,7 +1012,17 @@ class TradeBot:
                 )
             except BitgetError as e:
                 log(f"[ERROR] order rejected on {symbol}: {e}")
-                notify(f"Order rejected — {symbol}", [str(e)], ORANGE)
+                # Back off before retrying this symbol. A rejection is
+                # almost always a standing condition (not enough free
+                # margin, bad parameter), so an immediate retry just
+                # reproduces it every cycle and floods the channel.
+                self._start_cooldown(symbol, f"order rejected ({e.code})")
+                notify(f"Order rejected — {symbol}", [
+                    str(e),
+                    "",
+                    f"Not retrying {symbol} for {C.REJECT_COOLDOWN_MIN:.0f} minutes.",
+                ], ORANGE)
+                self._save_state()
                 return False
         else:
             log("  (dry run — no order sent)")

@@ -273,8 +273,23 @@ class BitgetClient:
         raise BitgetError("could not read account equity")
 
     def get_available(self):
+        """
+        Balance actually usable to open a NEW position.
+
+        `available` does not subtract margin already locked by resting
+        orders and open positions, so sizing from it produces orders the
+        exchange rejects with 40762. Bitget exposes the real figure as
+        maxOpenPosAvailable; prefer it and fall back only if absent.
+        """
         acct = self.get_account()
-        return float(acct.get("available", 0) or 0)
+        for key in ("maxOpenPosAvailable", "maxTransferOut", "available"):
+            raw = acct.get(key)
+            if raw not in (None, ""):
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
 
     def set_position_mode(self, one_way=True):
         return self._request(
