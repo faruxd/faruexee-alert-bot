@@ -508,6 +508,88 @@ def test_hold_side():
           bot.state["positions"]["SOLUSDT"]["hold_side"])
 
 
+def test_orphan_adoption():
+    """
+    A host without persistent storage loses the state file on every
+    restart, so a position opened before a redeploy comes back as an
+    orphan. Ignoring orphans leaves live positions with no take-profit
+    and no break-even move, and silently makes the operator place
+    targets by hand after every deploy.
+    """
+    print("\nOrphan position adoption")
+    import faruexee_trade_bot as T
+
+    POS = {"symbol": "BTCUSDT", "holdSide": "sell", "total": "0.0009",
+           "openPriceAvg": "64775.5"}
+
+    def build(plans):
+        class Stub(BitgetClient):
+            def __init__(self):
+                super().__init__("", "", "")
+                self._specs = dict(FAKE_SPECS)
+                self.tps = []
+
+            def get_plan_orders(self, symbol=None, plan_type="profit_loss"):
+                return plans
+
+            def place_partial_tp(self, sym, hold, size, px, **kw):
+                self.tps.append((size, px))
+                return {}
+
+        b = T.TradeBot.__new__(T.TradeBot)
+        b.cfg = EngineConfig()
+        b.client = Stub()
+        b.live = True
+        b.offline = False
+        b.equity = 20.96
+        b.state = {"orders": {}, "positions": {}, "daily": {},
+                   "halted": False, "halt_reason": "",
+                   "baseline_equity": 20.99, "cooldowns": {}}
+        return b
+
+    alerts = []
+    original_notify = T.notify
+    T.notify = lambda title, lines, color=0: alerts.append(title)
+    import io
+    import contextlib
+
+    try:
+        # Stop present, no target -> adopt and place one.
+        bot = build([{"planType": "pos_loss", "triggerPrice": "65240.7"}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bot._handle_orphan(POS)
+        pos = bot.state["positions"]["BTCUSDT"]
+        check("orphan with a stop is adopted", pos.get("adopted") is True)
+        check("orphan is managed, not ignored", pos.get("unmanaged") is False)
+        check("entry read from the exchange", pos["entry"] == 64775.5, pos["entry"])
+        check("stop read from plan orders", pos["sl"] == 65240.7, pos["sl"])
+        check("a target is placed for the full size",
+              len(bot.client.tps) == 1 and abs(bot.client.tps[0][0] - 0.0009) < 1e-9,
+              bot.client.tps)
+        # Short: target must sit BELOW entry.
+        check("adopted target is on the profitable side",
+              bot.client.tps[0][1] < 64775.5, bot.client.tps[0][1])
+
+        # Already has a target -> do not duplicate.
+        alerts.clear()
+        bot = build([{"planType": "pos_loss", "triggerPrice": "65240.7"},
+                     {"planType": "profit_plan", "triggerPrice": "63845"}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bot._handle_orphan(POS)
+        check("existing target is not duplicated", bot.client.tps == [],
+              bot.client.tps)
+
+        # No stop at all -> loud alert, that is unbounded risk.
+        alerts.clear()
+        bot = build([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bot._handle_orphan(POS)
+        check("a position with no stop raises an alert",
+              any("NO STOP LOSS" in a for a in alerts), alerts)
+    finally:
+        T.notify = original_notify
+
+
 def test_tp_ladder():
     print("\nTake-profit ladder")
     bot = make_bot(1000.0)
@@ -559,6 +641,7 @@ if __name__ == "__main__":
     test_engine()
     test_size_units()
     test_hold_side()
+    test_orphan_adoption()
     test_tp_coverage()
     test_tp_ladder()
     test_config()

@@ -180,6 +180,18 @@ REJECT_COOLDOWN_MIN = _f("REJECT_COOLDOWN_MIN", 30.0)
 # rejected for being a few cents over.
 MARGIN_SAFETY       = _f("MARGIN_SAFETY", 0.90)
 
+# Adopt positions found on the exchange that the bot has no record of.
+#
+# On a host without persistent storage the state file is wiped by every
+# restart, so a position opened before a redeploy comes back as an
+# orphan. Without adoption it is ignored forever: no take-profit, no
+# break-even move. With it on, the bot reads the position and its stop
+# from the exchange and places a target derived from the actual risk
+# distance. The original zone-based targets cannot be recovered, so an
+# adopted position gets one target at ADOPT_TP_R times its risk.
+ADOPT_ORPHANS      = _b("ADOPT_ORPHANS", True)
+ADOPT_TP_R         = _f("ADOPT_TP_R", 2.0)
+
 
 # =============================================================
 #   STRATEGY  (passed into faruexee_engine.EngineConfig)

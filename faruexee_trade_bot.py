@@ -358,20 +358,140 @@ class TradeBot:
                 log(f"Reconcile: position {sym} already closed — journalling")
                 self._close_out(sym, reason="closed_while_offline")
 
-        # Record positions we did not open (manual trades, prior runs).
+        # Positions the bot has no record of: either opened by hand, or
+        # opened by a previous run whose state file did not survive.
         for p in live_positions:
             sym = p["symbol"]
             if sym not in self.state["positions"]:
-                log(f"Reconcile: found unmanaged position on {sym} — will not touch it")
-                self.state["positions"][sym] = {
-                    "unmanaged": True,
-                    "hold_side": p.get("holdSide"),
-                    "opened_at": now_iso(),
-                    "symbol": sym,
-                }
+                self._handle_orphan(p)
 
         log(f"Reconciled: {len(self.state['positions'])} position(s), "
             f"{len(self.state['orders'])} resting order(s)")
+
+    def _read_protection(self, symbol):
+        """
+        What protection does the exchange already hold for this symbol?
+        Returns (stop_price_or_None, has_take_profit).
+        """
+        stop, has_tp = None, False
+        try:
+            plans = self.client.get_plan_orders(symbol)
+        except BitgetError as e:
+            log(f"[WARN] plan order lookup {symbol}: {e}")
+            return None, False
+
+        for p in plans:
+            kind = f"{p.get('planType', '')}{p.get('planStatus', '')}".lower()
+            trigger = p.get("triggerPrice") or p.get("price")
+            if "loss" in kind:
+                try:
+                    stop = float(trigger)
+                except (TypeError, ValueError):
+                    pass
+            elif "profit" in kind:
+                has_tp = True
+        return stop, has_tp
+
+    def _handle_orphan(self, live_pos):
+        """
+        Take over a position the bot has no record of.
+
+        The zone that produced it is gone with the state file, so the
+        original laddered targets cannot be recovered. What can be
+        recovered is the position and its stop, which is enough to place
+        one sensible target. The alternative — ignoring it — leaves a
+        live position with no take-profit and no break-even move, and
+        quietly makes the operator do it by hand every redeploy.
+        """
+        sym = live_pos["symbol"]
+        try:
+            size = float(live_pos.get("total", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+
+        entry = None
+        for key in ("openPriceAvg", "averageOpenPrice", "avgOpenPrice"):
+            try:
+                if live_pos.get(key):
+                    entry = float(live_pos[key])
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        try:
+            hold_side = self.client.norm_hold_side(live_pos.get("holdSide"))
+        except BitgetError:
+            hold_side = None
+
+        stop, has_tp = self._read_protection(sym)
+
+        # A position with no stop at all is the one thing worth shouting
+        # about — that is unbounded risk, not a missing convenience.
+        if stop is None:
+            log(f"[ALERT] {sym}: position has NO STOP LOSS on the exchange")
+            notify(f"NO STOP LOSS — {sym}", [
+                f"A `{size}` position is open with no stop order on the exchange.",
+                "The bot did not open this, or its stop was cancelled.",
+                "",
+                "**Set a stop on Bitget now, or close the position.**",
+            ], RED)
+
+        if not C.ADOPT_ORPHANS or not (size > 0 and entry and hold_side):
+            log(f"Reconcile: unmanaged position on {sym} — leaving it alone")
+            self.state["positions"][sym] = {
+                "unmanaged": True, "symbol": sym,
+                "hold_side": live_pos.get("holdSide"),
+                "opened_at": now_iso(),
+            }
+            return
+
+        if has_tp:
+            log(f"Reconcile: adopting {sym} — already has a take-profit")
+        else:
+            log(f"Reconcile: adopting {sym} — no take-profit found")
+
+        risk = abs(entry - stop) if stop else None
+        tp1 = None
+        if risk:
+            tp1 = (entry + risk * C.ADOPT_TP_R) if hold_side == "long" \
+                else (entry - risk * C.ADOPT_TP_R)
+            tp1 = self.client.round_price(
+                sym, tp1, "down" if hold_side == "long" else "up")
+
+        self.state["positions"][sym] = {
+            "symbol": sym,
+            "timeframe": "adopted",
+            "zone_id": "adopted",
+            "side": "buy" if hold_side == "long" else "sell",
+            "hold_side": hold_side,
+            "entry": entry,
+            "sl": stop if stop else entry,
+            "tp1": tp1, "tp2": None, "tp3": None,
+            "rr": C.ADOPT_TP_R if risk else 0,
+            "orig_size": size,
+            "risk_usdt": risk * size if risk else 0,
+            "opened_at": now_iso(),
+            # Nothing to place if it already has a target, or if there is
+            # no stop to derive one from.
+            "tps_placed": has_tp or tp1 is None,
+            "be_moved": False,
+            "unmanaged": False,
+            "adopted": True,
+        }
+
+        if not has_tp and tp1 is not None:
+            placed = self._place_tp_ladder(sym)
+            if placed:
+                notify(f"Adopted position — {sym}", [
+                    f"Found a `{size}` {hold_side} position with no take-profit "
+                    f"(state was lost on restart).",
+                    f"Entry `{entry}`   Stop `{stop}`",
+                    f"Placed a target at `{tp1}` "
+                    f"({C.ADOPT_TP_R:.1f}x the risk distance).",
+                    "",
+                    "_The original zone targets could not be recovered, so this "
+                    "is a risk-derived substitute._",
+                ], BLUE)
 
     # ---------------------------------------------------------
     #   CAPACITY / CIRCUIT BREAKERS
