@@ -1,0 +1,310 @@
+"""
+Backtest engine.
+
+Imports the SAME `evaluate` the live bot calls. If these could drift, the
+backtest would be worthless -- so the strategy is never reimplemented here, only
+driven.
+
+It also replicates the live guards that affect which trades are available:
+settlement blackout, the settlement flatten, one position at a time, and the
+daily entry cap. A backtest that ignores the guards measures a strategy the bot
+will never actually run.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional, Sequence
+
+from backtest.fills import (
+    fee_for,
+    find_entry_fill,
+    gross_pnl,
+    stop_fill_price,
+    stop_hit,
+    target_hit,
+)
+from cf_bot import guards
+from cf_bot.strategy import (
+    ENTRY_VALID_BARS,
+    TIME_STOP_BARS,
+    Bar,
+    StrategyParams,
+    evaluate,
+    position_size,
+)
+
+
+@dataclass(frozen=True)
+class Trade:
+    symbol: str
+    side: str
+    entry_ts: int
+    exit_ts: int
+    entry_price: Decimal
+    exit_price: Decimal
+    qty: Decimal
+    gross: Decimal
+    fees: Decimal
+    funding: Decimal
+    net: Decimal
+    r_multiple: Decimal
+    exit_reason: str
+
+    @property
+    def is_win(self) -> bool:
+        return self.net > 0
+
+
+@dataclass
+class BacktestConfig:
+    symbol: str
+    params: StrategyParams
+    risk_pct: Decimal = Decimal("1.0")
+    starting_equity: Decimal = Decimal("1000")
+    # Funding rate assumed at every bar, as a fraction per 8h. The regime filter
+    # requires abs(funding) <= 0.1%, so a value here of 0 means "assume funding
+    # was always benign" -- which is OPTIMISTIC. Supply real funding data for a
+    # trustworthy result. The report states which was used.
+    assumed_funding: Optional[Decimal] = Decimal("0")
+    apply_guards: bool = True
+
+
+def _reason_none(bars_needed: int, available: int) -> str:
+    return f"insufficient history: need {bars_needed}, have {available}"
+
+
+def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trade], list[str]]:
+    """
+    Walk the bar series and return (trades, warnings).
+
+    Equity compounds: each trade is sized off equity at the time it was taken,
+    matching the live sizing rule.
+    """
+    trades: list[Trade] = []
+    warnings: list[str] = []
+    bars = list(bars)
+
+    if len(bars) < 100:
+        warnings.append(_reason_none(100, len(bars)))
+        return trades, warnings
+
+    equity = config.starting_equity
+    open_until_index = -1  # index through which a position is held
+    entries_by_day: dict[str, int] = {}
+    consecutive_losses = 0
+    daily_realised: dict[str, Decimal] = {}
+    day_open_equity: dict[str, Decimal] = {}
+
+    for i in range(1, len(bars)):
+        if i <= open_until_index:
+            continue  # a position is still open; only one at a time
+
+        signal_bar = bars[i]
+        day_key = _utc_day(signal_bar.timestamp_ms)
+        day_open_equity.setdefault(day_key, equity)
+
+        if config.apply_guards:
+            if entries_by_day.get(day_key, 0) >= guards.MAX_ENTRIES_PER_UTC_DAY:
+                continue
+            if consecutive_losses >= guards.MAX_CONSECUTIVE_LOSSES:
+                continue
+            realised = daily_realised.get(day_key, Decimal(0))
+            opening = day_open_equity[day_key]
+            if opening > 0 and realised / opening * Decimal(100) <= guards.DAILY_LOSS_LIMIT_PCT:
+                continue
+
+        in_blackout = (
+            guards.in_settlement_blackout(signal_bar.timestamp_ms)
+            if config.apply_guards
+            else False
+        )
+
+        signal = evaluate(
+            symbol=config.symbol,
+            bars=bars[: i + 1],
+            funding_rate=config.assumed_funding,
+            params=config.params,
+            in_settlement_blackout=in_blackout,
+        )
+        if signal is None:
+            continue
+
+        fill = find_entry_fill(
+            bars=bars,
+            signal_index=i,
+            side=signal.side,
+            limit_price=signal.entry_price,
+            valid_bars=ENTRY_VALID_BARS,
+        )
+        if fill is None:
+            continue  # order expired unfilled -- this is the common case
+
+        qty = position_size(
+            equity=equity,
+            risk_pct=config.risk_pct,
+            entry_price=signal.entry_price,
+            stop_price=signal.stop_price,
+        )
+        if qty <= 0:
+            continue
+
+        trade = _simulate_exit(
+            bars=bars,
+            fill_index=fill.bar_index,
+            entry_price=fill.price,
+            signal=signal,
+            qty=qty,
+            config=config,
+        )
+        trades.append(trade)
+
+        equity += trade.net
+        entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
+        daily_realised[day_key] = daily_realised.get(day_key, Decimal(0)) + trade.net
+        consecutive_losses = 0 if trade.is_win else consecutive_losses + 1
+
+        open_until_index = _index_of_ts(bars, trade.exit_ts, fallback=fill.bar_index)
+
+        if equity <= 0:
+            warnings.append(f"equity reached {equity} at {trade.exit_ts}; stopping")
+            break
+
+    return trades, warnings
+
+
+def _simulate_exit(
+    bars: list[Bar],
+    fill_index: int,
+    entry_price: Decimal,
+    signal,
+    qty: Decimal,
+    config: BacktestConfig,
+) -> Trade:
+    """
+    Walk forward from the fill bar to whichever exit comes first.
+
+    Precedence within a single bar is STOP > TARGET. Bar data cannot resolve
+    intrabar ordering, and assuming the favourable one manufactures edge.
+    """
+    side = signal.side
+    risk_per_unit = abs(signal.entry_price - signal.stop_price)
+    last_index = min(fill_index + TIME_STOP_BARS, len(bars) - 1)
+
+    exit_price: Optional[Decimal] = None
+    exit_ts = bars[last_index].timestamp_ms
+    exit_reason = "time_stop"
+    exit_is_maker = False
+
+    for index in range(fill_index, last_index + 1):
+        bar = bars[index]
+
+        if config.apply_guards and guards.should_flatten_for_settlement(bar.timestamp_ms):
+            exit_price = bar.close
+            exit_ts = bar.timestamp_ms
+            exit_reason = "settlement_flatten"
+            exit_is_maker = False
+            break
+
+        if stop_hit(bar, side, signal.stop_price):
+            exit_price = stop_fill_price(side, signal.stop_price)
+            exit_ts = bar.timestamp_ms
+            exit_reason = "stop"
+            exit_is_maker = False
+            break
+
+        if target_hit(bar, side, signal.target_price):
+            exit_price = signal.target_price
+            exit_ts = bar.timestamp_ms
+            exit_reason = "target"
+            exit_is_maker = True  # resting reduce-only limit
+            break
+
+    if exit_price is None:
+        # Time stop: flatten at market on the close of entry_bar + 12.
+        exit_price = bars[last_index].close
+        exit_ts = bars[last_index].timestamp_ms
+        exit_reason = "time_stop"
+        exit_is_maker = False
+
+    gross = gross_pnl(side, entry_price, exit_price, qty)
+
+    # Entry was a post-only limit -> maker. Exit fee depends on how it left.
+    entry_fee = fee_for(entry_price * qty, is_maker=True)
+    exit_fee = fee_for(exit_price * qty, is_maker=exit_is_maker)
+    fees = entry_fee + exit_fee
+
+    funding = _funding_cost(
+        bars, fill_index, exit_ts, side, entry_price, qty, config.assumed_funding
+    )
+
+    net = gross - fees - funding
+    r_multiple = net / (risk_per_unit * qty) if risk_per_unit > 0 and qty > 0 else Decimal(0)
+
+    return Trade(
+        symbol=config.symbol,
+        side=side,
+        entry_ts=bars[fill_index].timestamp_ms,
+        exit_ts=exit_ts,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        qty=qty,
+        gross=gross,
+        fees=fees,
+        funding=funding,
+        net=net,
+        r_multiple=r_multiple,
+        exit_reason=exit_reason,
+    )
+
+
+def _funding_cost(
+    bars: list[Bar],
+    fill_index: int,
+    exit_ts: int,
+    side: str,
+    entry_price: Decimal,
+    qty: Decimal,
+    rate: Optional[Decimal],
+) -> Decimal:
+    """
+    Funding paid while the position was open.
+
+    Applies the rate known at bar time for each settlement boundary crossed. The
+    settlement flatten normally closes us before a boundary, so this is usually
+    zero -- but it is charged when it does apply rather than quietly ignored.
+    """
+    if rate is None or rate == 0:
+        return Decimal(0)
+
+    entry_ts = bars[fill_index].timestamp_ms
+    crossings = 0
+    for index in range(fill_index, len(bars)):
+        bar = bars[index]
+        if bar.timestamp_ms > exit_ts:
+            break
+        if bar.timestamp_ms <= entry_ts:
+            continue
+        if guards.minutes_until_next_settlement(bar.timestamp_ms) == 0:
+            crossings += 1
+
+    if crossings == 0:
+        return Decimal(0)
+
+    notional = entry_price * qty
+    cost = notional * abs(rate) * Decimal(crossings)
+    return cost  # charged as a cost regardless of side: pessimistic
+
+
+def _utc_day(timestamp_ms: int) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _index_of_ts(bars: list[Bar], timestamp_ms: int, fallback: int) -> int:
+    for index in range(fallback, len(bars)):
+        if bars[index].timestamp_ms >= timestamp_ms:
+            return index
+    return fallback

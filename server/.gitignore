@@ -1,0 +1,14 @@
+# Secrets -- never commit
+.env
+
+# Operational artefacts
+KILL
+logs/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

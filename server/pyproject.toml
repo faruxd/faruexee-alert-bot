@@ -1,0 +1,10 @@
+[project]
+name = "cf-bot"
+version = "0.1.0"
+description = "Forced Flow (CF) perpetual futures bot -- Phase 1: state and reconciliation"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::RuntimeWarning"]

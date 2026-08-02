@@ -1,0 +1,89 @@
+# =============================================================================
+#  cf_bot on Render
+#
+#  ⚠ THIS FILE IS NOT AUTO-DETECTED BY RENDER.
+#
+#  Render Blueprints read `render.yaml` from the REPOSITORY ROOT. This repo
+#  already has one there, and it deploys the older faruexee-trade-bot. Adding
+#  cf-bot to that file would put a Blueprint sync in a position to overwrite
+#  dashboard settings on a service that is currently live.
+#
+#  So cf_bot is deployed as a MANUAL service instead, which touches nothing
+#  that already exists. This file is the reference for those settings -- copy
+#  them into the dashboard. See DEPLOY_RENDER.md for the full walkthrough.
+#
+#  Dashboard → New → Background Worker:
+#
+#      Repository        faruxd/faruexee-alert-bot
+#      Branch            main
+#      Root Directory    server            <-- REQUIRED, easy to miss
+#      Runtime           Python 3
+#      Build Command     pip install -r requirements.txt
+#      Start Command     python -m cf_bot
+#      Instance Type     Starter           (workers have no free tier)
+#      Auto-Deploy       Off               <-- REQUIRED, see below
+#
+#  Auto-Deploy must be Off. You do not want a push to main restarting a bot
+#  that is holding a position.
+#
+#  A Background Worker, not a Web Service: free web services sleep after ~15
+#  minutes without HTTP, and a sleeping bot runs no time stops, no settlement
+#  flatten, and no reconciliation. See DEPLOY_RENDER.md.
+# =============================================================================
+
+# ---- Environment variables to set in the dashboard --------------------------
+#
+#  Secrets. Enter these in the Render dashboard ONLY. Never commit them.
+#  The key must have READ + TRADE permission only -- startup aborts if it
+#  reports withdrawal or transfer rights.
+#
+#      BITGET_API_KEY              <your key>
+#      BITGET_API_SECRET           <your secret>
+#      BITGET_API_PASSPHRASE       <your passphrase>
+#
+#  Mode gate. Deploy with demo FIRST and confirm the logged state matches the
+#  Bitget UI before arming.
+#
+#      MODE                                    demo
+#      I_UNDERSTAND_THIS_TRADES_REAL_MONEY     yes     (only when MODE=live)
+#
+#  Kill switch. Set to 1 to halt: the service restarts, cancels all orders,
+#  flattens all positions and exits non-zero.
+#
+#      CF_KILL                                 0
+#
+#      PYTHON_VERSION                          3.12.7
+#
+# -----------------------------------------------------------------------------
+#
+#  The block below is a valid Blueprint definition, kept for the case where
+#  cf_bot moves to its own repository. In THIS repo it is inert -- Render never
+#  reads a render.yaml outside the root.
+
+services:
+  - type: worker
+    name: cf-bot
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m cf_bot
+    autoDeploy: false
+
+    envVars:
+      - key: BITGET_API_KEY
+        sync: false
+      - key: BITGET_API_SECRET
+        sync: false
+      - key: BITGET_API_PASSPHRASE
+        sync: false
+      - key: MODE
+        value: demo
+      - key: I_UNDERSTAND_THIS_TRADES_REAL_MONEY
+        sync: false
+      - key: CF_KILL
+        value: "0"
+      - key: PYTHON_VERSION
+        value: "3.12.7"

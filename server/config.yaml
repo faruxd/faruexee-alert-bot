@@ -1,0 +1,53 @@
+# =============================================================================
+#  cf_bot -- configuration
+#
+#  Validated by pydantic on startup. Unknown keys are a FATAL ERROR, not a
+#  warning: a typo'd key must not look like it took effect.
+#
+#  Credentials do NOT belong in this file. They are read from the environment
+#  only. See .env.example.
+# =============================================================================
+
+exchange:
+  # Symbols scanned each loop, in priority order. The bot holds at most ONE
+  # position across ALL of them (see guards.MAX_CONCURRENT_POSITIONS), so this
+  # list widens the search for a signal -- it does not multiply risk.
+  symbols:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+    - "BNB/USDT:USDT"
+    - "XRP/USDT:USDT"
+    - "DOGE/USDT:USDT"
+    - "LINK/USDT:USDT"
+    - "AVAX/USDT:USDT"
+
+  # Fixed at 5m. The strategy's bar counts (ATR 14, 30d percentile, 3-bar entry
+  # validity, 12-bar time stop) are all defined against 5m bars.
+  timeframe: "5m"
+  product_type: "USDT-FUTURES"
+  margin_coin: "USDT"
+
+risk:
+  # PERCENT of equity risked per trade. 1.0 means 1%.
+  #
+  # Same unit as MAX_RISK_PCT in cf_bot/constants.py, which hard-caps this at
+  # 1.0 and is not configurable. Startup raises if this exceeds the cap.
+  risk_pct: 1.0
+
+strategy:
+  # The ONLY three tunable parameters in the system. Do not add a fourth.
+  k: 2.5     # displacement threshold, in ATR units
+  s: 1.25    # stop distance, in ATR units
+  p: 30      # ATR percentile floor
+
+runtime:
+  loop_interval_seconds: 15.0
+  heartbeat_seconds: 300.0
+  kill_file: "KILL"
+
+logging:
+  level: "INFO"
+  file: "logs/cf_bot.jsonl"
+  max_bytes: 50000000
+  backup_count: 5

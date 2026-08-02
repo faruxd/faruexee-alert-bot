@@ -1,0 +1,10 @@
+# Pinned exactly. A trading bot that silently picks up a new ccxt minor version
+# on redeploy is a trading bot whose exchange behaviour changed without a diff.
+ccxt==4.5.70
+pydantic==2.13.4
+PyYAML==6.0.3
+structlog==26.1.0
+
+# Test-only
+pytest==9.1.1
+pytest-asyncio==1.4.0
