@@ -79,32 +79,36 @@ def test_documented_authorities_are_recognised():
     assert unrecognised_authorities(("read_only", "contract_trade")) == ()
 
 
-def test_undocumented_authorities_are_reported():
+def test_confirmed_undocumented_codes_no_longer_warn():
     """
-    A real account returned ["coow", "cpow"] -- codes absent from Bitget's
-    published vocabulary. The forbidden-substring check passes on those, but
-    only because it cannot interpret them. They must be surfaced, not treated
-    as a clean bill of health.
+    ["coow", "cpow"] is what a live Bitget key returns for Read + Trade --
+    undocumented, but verified against the UI on 2026-08-04. Recorded so the
+    warning stops firing every startup.
     """
-    assert unrecognised_authorities(("coow", "cpow")) == ("coow", "cpow")
+    assert unrecognised_authorities(("coow", "cpow")) == ()
+
+
+def test_genuinely_unknown_authorities_are_still_reported():
+    """The warning must still fire for vocabulary nobody has verified."""
+    assert unrecognised_authorities(("zzqq", "trade")) == ("zzqq",)
 
 
 def test_mixed_authorities_report_only_the_unknown_ones():
-    assert unrecognised_authorities(("readonly", "coow")) == ("coow",)
+    assert unrecognised_authorities(("readonly", "zzqq")) == ("zzqq",)
 
 
-async def test_undocumented_authorities_still_start_the_bot():
+async def test_unknown_authorities_still_start_the_bot():
     """
     Not fatal. The bot has no withdrawal code path, so an over-permissioned key
     is a custody risk the operator must judge, not something this process can
     act on. It warns rather than refusing to run.
     """
-    client = FakeBitgetClient(authorities=("coow", "cpow"))
-    assert await assert_cannot_withdraw(client) == ("coow", "cpow")
+    client = FakeBitgetClient(authorities=("zzqq", "trade"))
+    assert await assert_cannot_withdraw(client) == ("zzqq", "trade")
 
 
 async def test_an_undocumented_code_containing_withdraw_is_still_refused():
-    client = FakeBitgetClient(authorities=("coow", "wd_withdraw_own"))
+    client = FakeBitgetClient(authorities=("zzqq", "wd_withdraw_own"))
     with pytest.raises(PreflightError):
         await assert_cannot_withdraw(client)
 

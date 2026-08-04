@@ -63,6 +63,7 @@ FORBIDDEN_AUTHORITY_SUBSTRINGS = frozenset({"withdraw", "transfer"})
 # shown a green light that was never earned.
 KNOWN_SAFE_AUTHORITIES = frozenset(
     {
+        # Documented in Bitget's API reference.
         "readonly",
         "read_only",
         "read",
@@ -71,6 +72,17 @@ KNOWN_SAFE_AUTHORITIES = frozenset(
         "margin_trade",
         "contract_trade",
         "futures_trade",
+        # UNDOCUMENTED, but observed and confirmed. On 2026-08-04 a live key
+        # returned exactly ["coow", "cpow"], and the operator verified in the
+        # Bitget UI that the key held Read + Trade and nothing else. Recorded so
+        # the warning stops firing on every startup -- an alert that is always
+        # correct to ignore trains you to ignore alerts that are not.
+        #
+        # This narrows the noise, it does not widen what is permitted: the
+        # forbidden-substring check below still runs against every authority,
+        # documented or not.
+        "coow",
+        "cpow",
     }
 )
 
