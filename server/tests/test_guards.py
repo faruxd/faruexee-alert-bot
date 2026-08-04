@@ -124,55 +124,61 @@ def test_zero_size_positions_do_not_count():
 # --- daily entry cap -------------------------------------------------------
 
 
-def test_entries_are_counted_from_exchange_fills():
-    fills = tuple(
-        make_fill(
-            client_oid=client_order_id("BTC/USDT:USDT", i, "long", PURPOSE_ENTRY),
-            trade_id=f"t{i}",
-        )
-        for i in range(MAX_ENTRIES_PER_UTC_DAY)
+def test_entries_are_counted_from_positions_not_fills():
+    """
+    REGRESSION. Counting fills by client order id broke in production: an exit
+    through a preset TP/SL carries BITGET's order id, not ours, so every exit
+    was counted as a fresh entry. One completed round trip reported "4/3
+    entries" and locked the bot out for the rest of the day.
+    """
+    closed = tuple(make_closed("-0.1", closed_at=ts(10) + i) for i in range(3))
+    assert count_entries_today(closed, ()) == MAX_ENTRIES_PER_UTC_DAY
+    assert guard_max_entries_per_day(
+        make_ctx(todays_closed_positions=closed)
+    ).allowed is False
+
+
+def test_exit_fills_do_not_inflate_the_count():
+    """A completed round trip is ONE entry, however many fills it produced."""
+    one_round_trip = (make_closed("-0.7", closed_at=ts(10)),)
+    noisy_fills = tuple(
+        make_fill(client_oid=None, order_id=f"bitget-generated-{i}", trade_id=f"t{i}")
+        for i in range(11)
     )
-    assert count_entries_today(fills) == MAX_ENTRIES_PER_UTC_DAY
-    assert guard_max_entries_per_day(make_ctx(todays_fills=fills)).allowed is False
+    verdict = guard_max_entries_per_day(
+        make_ctx(todays_closed_positions=one_round_trip, todays_fills=noisy_fills)
+    )
+    assert verdict.allowed is True, "exit fills were counted as entries again"
+    assert "1/3" in verdict.reason
 
 
-def test_partial_fills_of_one_entry_count_once():
-    """Three fills of the same order are one entry, not three."""
-    oid = client_order_id("BTC/USDT:USDT", 1, "long", PURPOSE_ENTRY)
-    fills = tuple(make_fill(client_oid=oid, trade_id=f"t{i}") for i in range(3))
-    assert count_entries_today(fills) == 1
+def test_an_open_position_counts_as_an_entry():
+    assert count_entries_today((), (make_position(),)) == 1
 
 
-def test_our_own_exit_fills_are_not_entries():
-    stop_oid = client_order_id("BTC/USDT:USDT", 1, "long", PURPOSE_STOP)
-    assert count_entries_today((make_fill(client_oid=stop_oid),)) == 0
+def test_zero_size_positions_are_not_entries():
+    assert count_entries_today((), (make_position(contracts="0"),)) == 0
 
 
-def test_an_unrecognised_fill_is_counted_as_an_entry():
-    """
-    Over-counting blocks trading earlier, which is the safe direction. A fill we
-    cannot account for might be a manual trade -- we do not assume it was free.
-    """
-    assert count_entries_today((make_fill(client_oid=None, order_id="manual-1"),)) == 1
+def test_open_and_closed_positions_are_summed():
+    closed = (make_closed("-0.1"), make_closed("0.3"))
+    assert count_entries_today(closed, (make_position(),)) == 3
+
+
+def test_a_flat_day_with_no_history_allows_trading():
+    assert guard_max_entries_per_day(make_ctx()).allowed is True
 
 
 def test_a_restart_does_not_reset_the_daily_entry_counter():
     """
-    The whole point of deriving from fills. Two independently constructed
-    contexts -- as a fresh process would build -- see the same count.
+    The whole point of deriving from the exchange. Two independently built
+    contexts -- as a fresh process would produce -- see the same count.
     """
-    fills = tuple(
-        make_fill(
-            client_oid=client_order_id("BTC/USDT:USDT", i, "long", PURPOSE_ENTRY),
-            trade_id=f"t{i}",
-        )
-        for i in range(MAX_ENTRIES_PER_UTC_DAY)
-    )
-    before_restart = guard_max_entries_per_day(make_ctx(todays_fills=fills))
-    after_restart = guard_max_entries_per_day(make_ctx(todays_fills=fills))
-
-    assert before_restart.allowed is False
-    assert after_restart.allowed is False
+    closed = tuple(make_closed("-0.1", closed_at=ts(10) + i) for i in range(3))
+    before = guard_max_entries_per_day(make_ctx(todays_closed_positions=closed))
+    after = guard_max_entries_per_day(make_ctx(todays_closed_positions=closed))
+    assert before.allowed is False
+    assert after.allowed is False
 
 
 # --- orders per hour -------------------------------------------------------

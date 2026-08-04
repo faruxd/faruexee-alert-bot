@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional, Sequence
 
-from cf_bot.ids import is_entry, is_ours
 from cf_bot.state import ClosedPosition, Fill, Position
 
 # ---------------------------------------------------------------------------
@@ -142,32 +141,30 @@ def should_flatten_for_settlement(now_ms: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def count_entries_today(fills: Sequence[Fill]) -> int:
+def count_entries_today(
+    closed_positions: Sequence[ClosedPosition], live_positions: Sequence[Position]
+) -> int:
     """
-    How many entries we have made today, derived purely from exchange fills.
+    How many positions we OPENED today: closed today + still open.
 
-    Counting rules:
-      - Distinct client order ids carrying our entry marker count once each,
-        no matter how many partial fills they produced.
-      - A fill whose client order id we do not recognise is counted as its own
-        entry. It came from somewhere we cannot account for (a manual trade, an
-        older build), and over-counting blocks trading earlier, which is the
-        safe direction.
-      - Our own stop/target/flatten fills are exits and are not counted.
+    Derived from the exchange's own position history, so it survives a restart
+    and needs no interpretation of order ids.
+
+    WHY NOT FILLS. The first version counted distinct entry client order ids and
+    treated any unrecognised id as another entry. But an exit through a preset
+    take-profit or stop carries BITGET's order id, not ours -- so every exit was
+    counted as a fresh entry and each round trip consumed two of the three daily
+    slots. In production this reported "4/3 entries" after a single completed
+    trade and locked out the rest of the day.
+
+    Counting positions instead is unambiguous: one position opened is one entry,
+    however many partial fills it took to build or unwind.
+
+    A position opened yesterday and closed today is counted here. That
+    over-counts by one on that day, which blocks earlier -- the safe direction.
     """
-    entry_ids: set[str] = set()
-    unknown_orders: set[str] = set()
-
-    for fill in fills:
-        cid = fill.client_order_id
-        if is_entry(cid):
-            entry_ids.add(cid)  # type: ignore[arg-type]
-        elif is_ours(cid):
-            continue  # our own exit leg
-        else:
-            unknown_orders.add(fill.order_id or fill.trade_id)
-
-    return len(entry_ids) + len(unknown_orders)
+    live = [p for p in live_positions if p.contracts > 0]
+    return len(closed_positions) + len(live)
 
 
 def realised_pnl_today(closed: Sequence[ClosedPosition]) -> Decimal:
@@ -216,7 +213,7 @@ def guard_max_concurrent_positions(ctx: GuardContext) -> GuardVerdict:
 
 
 def guard_max_entries_per_day(ctx: GuardContext) -> GuardVerdict:
-    entries = count_entries_today(ctx.todays_fills)
+    entries = count_entries_today(ctx.todays_closed_positions, ctx.positions)
     if entries >= MAX_ENTRIES_PER_UTC_DAY:
         return GuardVerdict.block(
             f"{entries}/{MAX_ENTRIES_PER_UTC_DAY} entries already made this UTC day"
