@@ -258,3 +258,84 @@ async def test_demo_mode_never_transmits_an_order(app_config, creds, patch_clien
 
     assert code == EXIT_OK
     assert client.sent_orders == [], "demo mode transmitted an order"
+
+
+# --- kill switch at startup ------------------------------------------------
+#
+# On Render the kill switch is an environment variable, and changing it
+# RESTARTS the service -- so the switch always arrives as a startup event and
+# the mid-run flatten path can never run there. An earlier version refused to
+# start without connecting, leaving a live position open while reporting the
+# bot as killed.
+
+
+async def test_kill_at_startup_connects_and_flattens(
+    app_config, creds, patch_client, ccxt_position_long, caplog
+):
+    caplog.set_level(logging.INFO)
+    client = patch_client(FakeBitgetClient(positions=[ccxt_position_long]))
+    app_config.kill_file.write_text("", encoding="utf-8")
+
+    code = await asyncio.wait_for(
+        main_module._kill_and_flatten(app_config, creds, get_logger()), timeout=10
+    )
+
+    assert code == EXIT_KILL_SWITCH
+    assert client.connect_calls == 1, "never connected, so never flattened"
+    assert any(o["kind"] == "close" for o in client.sent_orders), "position left open"
+    assert client.close_calls == 1
+
+
+async def test_kill_at_startup_flattens_even_if_reconcile_fails(
+    app_config, creds, patch_client, ccxt_position_long, exchange_error, caplog
+):
+    """Not knowing the state is a reason to close, not a reason to walk away."""
+    caplog.set_level(logging.ERROR)
+    client = patch_client(FakeBitgetClient(positions=[ccxt_position_long]))
+    client.closed_positions = exchange_error  # breaks reconcile only
+
+    code = await asyncio.wait_for(
+        main_module._kill_and_flatten(app_config, creds, get_logger()), timeout=10
+    )
+
+    assert code == EXIT_KILL_SWITCH
+    assert any(o["kind"] == "close" for o in client.sent_orders)
+    assert "killswitch.reconcile_failed" in caplog.text
+
+
+async def test_kill_at_startup_reports_when_it_cannot_connect(
+    app_config, creds, patch_client, caplog
+):
+    caplog.set_level(logging.ERROR)
+    client = patch_client(FakeBitgetClient())
+
+    async def no_connect():
+        raise ExchangeError("venue unreachable")
+
+    client.connect = no_connect
+    app_config.kill_file.write_text("", encoding="utf-8")
+
+    code = await asyncio.wait_for(
+        main_module._kill_and_flatten(app_config, creds, get_logger()), timeout=10
+    )
+
+    assert code == EXIT_KILL_SWITCH
+    assert "killswitch.connect_failed" in caplog.text
+    assert "untouched" in caplog.text
+
+
+async def test_kill_at_startup_skips_preflight(
+    app_config, creds, patch_client, ccxt_position_long
+):
+    """
+    A hedge-mode account or a bad key must not stop the flatten. The account
+    being in a strange state is often WHY the operator hit the switch.
+    """
+    client = patch_client(
+        FakeBitgetClient(positions=[ccxt_position_long], position_mode="hedge_mode")
+    )
+    code = await asyncio.wait_for(
+        main_module._kill_and_flatten(app_config, creds, get_logger()), timeout=10
+    )
+    assert code == EXIT_KILL_SWITCH
+    assert any(o["kind"] == "close" for o in client.sent_orders)

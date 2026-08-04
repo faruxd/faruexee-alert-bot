@@ -92,7 +92,7 @@ async def _engage_kill_switch(
     """
     log.error("killswitch.engaged", kill_file=str(kill_file), action="cancel all, flatten all")
 
-    if client is None or state is None:
+    if client is None:
         log.error(
             "killswitch.halted_early",
             note="engaged before the exchange was reachable; nothing was placed by this process",
@@ -100,7 +100,11 @@ async def _engage_kill_switch(
         return EXIT_KILL_SWITCH
 
     failures: list[str] = []
-    symbols_to_clear = {p.symbol for p in state.live_positions} | set(client.symbols)
+    # With no snapshot we sweep every configured symbol. Not knowing what is
+    # open is a reason to close everything, not a reason to skip the flatten.
+    symbols_to_clear = set(client.symbols)
+    if state is not None:
+        symbols_to_clear |= {p.symbol for p in state.live_positions}
 
     for symbol in sorted(symbols_to_clear):
         try:
@@ -182,6 +186,45 @@ async def _notify_position_changes(
         await notifier.send(
             position_closed_message(symbol, side, realised, current.equity)
         )
+
+
+async def _kill_and_flatten(config: AppConfig, credentials: Credentials, log) -> int:
+    """
+    Kill switch engaged before the loop started: connect, flatten, exit.
+
+    Deliberately skips preflight. The account may be in any state -- that is
+    often WHY the operator hit the switch -- and refusing to close positions
+    because, say, the position mode looks wrong would be exactly backwards.
+    """
+    client = BitgetClient(credentials, config.settings, config.mode)
+    limiter = RateLimiter()
+    notifier = DiscordNotifier.from_env(log)
+
+    try:
+        try:
+            await client.connect()
+        except ExchangeError as exc:
+            log.error(
+                "killswitch.connect_failed",
+                error=str(exc),
+                note="COULD NOT REACH THE EXCHANGE. Any open position is untouched.",
+            )
+            return EXIT_KILL_SWITCH
+
+        try:
+            state = await reconcile(client, config.mode)
+            log.error("killswitch.state_before_flatten", **state.log_payload())
+        except ReconcileError as exc:
+            # Flatten anyway. Not knowing the state is a reason to close, not a
+            # reason to walk away.
+            log.error("killswitch.reconcile_failed", error=str(exc))
+            state = None
+
+        return await _engage_kill_switch(
+            client, state, log, limiter, config.kill_file, notifier
+        )
+    finally:
+        await client.close()
 
 
 async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
@@ -334,19 +377,30 @@ def run(argv: Optional[list[str]] = None) -> int:
             note="MODE=live. This process will place real orders with real funds.",
         )
 
-    if kill_file_present(config.kill_file):
-        log.error(
-            "killswitch.engaged_at_startup",
-            kill_file=str(config.kill_file),
-            action="refusing to start",
-        )
-        return EXIT_KILL_SWITCH
-
     try:
         credentials = load_credentials()
     except ConfigError as exc:
         log.error("startup.credentials_missing", error=str(exc))
         return EXIT_CONFIG_ERROR
+
+    if kill_file_present(config.kill_file):
+        # DO NOT simply refuse to start. The contract is "cancel all orders,
+        # flatten all positions, exit", and on Render the kill switch is set as
+        # an environment variable -- which restarts the service. So the kill
+        # switch ALWAYS arrives as a startup event there and the mid-run flatten
+        # path can never execute. An earlier version refused to start without
+        # connecting, which left a live position open while reporting that the
+        # bot had been killed.
+        log.error(
+            "killswitch.engaged_at_startup",
+            kill_file=str(config.kill_file),
+            action="connecting to cancel orders and flatten positions",
+        )
+        try:
+            return asyncio.run(_kill_and_flatten(config, credentials, log))
+        except Exception as exc:
+            log.exception("killswitch.flatten_run_failed", error=str(exc))
+            return EXIT_KILL_SWITCH
 
     try:
         return asyncio.run(_run_loop(config, credentials, log))
