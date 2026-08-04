@@ -58,6 +58,7 @@ class FakeBitgetClient:
         self.mode = mode
         self.trading_enabled = mode == "live"
         self.ohlcv = ohlcv if ohlcv is not None else []
+        self.trigger_orders = []
         self.funding = funding
 
         self.connect_calls = 0
@@ -114,6 +115,9 @@ class FakeBitgetClient:
 
     async def fetch_open_orders(self):
         return self._resolve(self.open_orders)
+
+    async def fetch_trigger_orders(self, symbol):
+        return self._resolve(self.trigger_orders)
 
     async def fetch_todays_fills(self):
         return self._resolve(self.fills)

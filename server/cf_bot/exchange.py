@@ -522,9 +522,59 @@ class BitgetClient:
             raise ExchangeError(f"cancel_order {order_id} failed: {exc}") from exc
 
     async def cancel_all_orders(self, symbol: str) -> Any:
+        """
+        Cancel every resting order for a symbol.
+
+        "No order to cancel" is SUCCESS, not failure -- it is the state we were
+        asking for. Bitget signals it with code 22001.
+
+        This mattered in production: a market entry filled with nothing resting,
+        flatten() called this first, Bitget said 22001, the retry wrapper treated
+        it as a transport error, burned three attempts and raised. The market
+        close that should have followed never ran, and the bot halted holding a
+        position it believed was unprotected.
+        """
         self._require_connected()
         self._require_trading_enabled(f"cancel all orders on {symbol}")
         try:
             return await self._exchange.cancel_all_orders(symbol)
+        except ccxt.OrderNotFound:
+            return {"note": "no orders to cancel"}
         except Exception as exc:
+            text = str(exc)
+            if "22001" in text or "no order to cancel" in text.lower():
+                return {"note": "no orders to cancel"}
             raise ExchangeError(f"cancel_all_orders failed for {symbol}: {exc}") from exc
+
+    async def fetch_trigger_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """
+        Resting TRIGGER (plan) orders for a symbol -- where preset stops live.
+
+        THIS IS NOT OPTIONAL EXTRA COVERAGE. A stop/take-profit attached to an
+        entry via presetStopLossPrice does NOT appear in fetch_open_orders: it
+        becomes a plan order on /api/v2/mix/order/orders-plan-pending, which
+        ccxt only reaches when told `trigger: True`.
+
+        Checking only fetch_open_orders made the protection check structurally
+        incapable of ever seeing a preset stop -- a guaranteed false negative,
+        which in production made the bot try to flatten a correctly protected
+        position.
+
+        'profit_loss' is the plan type for TP/SL attached to a position;
+        'normal_plan' covers standalone trigger orders. Both are queried
+        because a stop can legitimately be either.
+        """
+        self._require_connected()
+        collected: list[dict[str, Any]] = []
+        for plan_type in ("profit_loss", "normal_plan"):
+            try:
+                collected.extend(
+                    await self._exchange.fetch_open_orders(
+                        symbol, params={"trigger": True, "isPlan": plan_type}
+                    )
+                )
+            except Exception as exc:
+                raise ExchangeError(
+                    f"fetch_trigger_orders({plan_type}) failed for {symbol}: {exc}"
+                ) from exc
+        return collected

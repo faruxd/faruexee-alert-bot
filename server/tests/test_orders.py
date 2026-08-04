@@ -533,3 +533,90 @@ async def test_rate_limiter_allows_an_initial_burst():
     for _ in range(5):
         await limiter.acquire()
     assert loop.time() - started < 0.5
+
+
+# --- protection detection --------------------------------------------------
+#
+# PRODUCTION INCIDENT 2026-08-04. A market entry on LTC filled and Bitget
+# attached the preset stop and take-profit correctly. _has_protection() checked
+# only fetch_open_orders() and reported UNPROTECTED, because a preset stop is a
+# PLAN order on a different endpoint and never appears there. The bot tried to
+# flatten a perfectly healthy position; the flatten then failed on an unrelated
+# bug, which is the only reason the position survived.
+
+
+def trigger_order(symbol="BTC/USDT:USDT"):
+    """A preset stop as Bitget actually reports it, via the plan endpoint."""
+    return {
+        "id": "plan-1",
+        "symbol": symbol,
+        "side": "sell",
+        "type": "market",
+        "triggerPrice": 62000.0,
+        "reduceOnly": True,
+        "info": {"planType": "profit_loss", "stopLossTriggerPrice": "62000"},
+    }
+
+
+async def test_a_preset_stop_visible_only_as_a_trigger_order_counts_as_protected(
+    log, limiter
+):
+    """The exact production false negative. Must not regress."""
+    client = FakeBitgetClient(positions=[position_payload(preset_stop=None)])
+    client.open_orders = []          # presets never appear here
+    client.trigger_orders = [trigger_order()]
+
+    result = await entry(client, log, limiter)
+
+    assert result.protected is True
+    assert not any(o["kind"] == "close" for o in client.sent_orders), \
+        "flattened a position that WAS protected"
+
+
+async def test_genuinely_unprotected_is_still_detected(log, limiter):
+    """The fix must not blind the check -- a bare position still gets flattened."""
+    client = FakeBitgetClient(positions=[position_payload(preset_stop=None)])
+    client.open_orders = []
+    client.trigger_orders = []
+
+    result = await entry(client, log, limiter)
+    assert result.protected is False
+    assert any(o["kind"] == "close" for o in client.sent_orders)
+
+
+# --- cancel_all_orders on an empty book ------------------------------------
+
+
+async def test_flatten_still_closes_when_there_is_nothing_to_cancel(log, limiter):
+    """
+    "No order to cancel" is the state we asked for, not a failure.
+
+    Production: a market entry left nothing resting, Bitget returned 22001, the
+    retry wrapper burned three attempts and raised, and the market close never
+    ran. The bot halted holding the position.
+    """
+    client = FakeBitgetClient(positions=[position_payload()])
+
+    async def nothing_to_cancel(symbol):
+        raise ExchangeError(
+            'cancel_all_orders failed: bitget {"code":"22001","msg":"No order to cancel"}'
+        )
+
+    client.cancel_all_orders = nothing_to_cancel
+
+    assert await flatten(client, "BTC/USDT:USDT", log, limiter, reason="test") is True
+    assert any(o["kind"] == "close" for o in client.sent_orders), \
+        "cancel failure blocked the close"
+
+
+async def test_cancel_failure_never_blocks_the_close(log, limiter):
+    """Cancelling is housekeeping. Closing is the safety-critical action."""
+    client = FakeBitgetClient(positions=[position_payload()])
+
+    async def boom(symbol):
+        raise ExchangeError("venue exploded")
+
+    client.cancel_all_orders = boom
+
+    assert await flatten(client, "BTC/USDT:USDT", log, limiter, reason="test") is True
+    assert any(o["kind"] == "close" for o in client.sent_orders)

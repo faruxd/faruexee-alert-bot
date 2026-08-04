@@ -166,23 +166,54 @@ async def _live_position(client: BitgetClient, symbol: str) -> Optional[Position
     return None
 
 
+def _has_stop_field(info: dict) -> bool:
+    """Any populated stop-loss field in a Bitget payload."""
+    for key in (
+        "presetStopLossPrice",
+        "presetStopLossExecutePrice",
+        "stopLossPrice",
+        "stopLossTriggerPrice",
+        "slTriggerPrice",
+        "triggerPrice",
+    ):
+        value = info.get(key)
+        if value not in (None, "", "0", 0, "0.0"):
+            return True
+    return False
+
+
 async def _has_protection(client: BitgetClient, symbol: str) -> bool:
     """
-    Is there a reduce-only order resting for this symbol?
+    Is this symbol's position covered by a stop on the exchange?
 
-    Bitget attaches preset stops as plan orders rather than ordinary resting
-    orders, so this checks both the open-order book and the position's own
-    preset stop field. Either counts as protected.
+    Checked in three places, because Bitget reports a stop differently
+    depending on how it was created:
+
+      1. TRIGGER (plan) orders -- where a preset stop actually lives. This is
+         the one that matters and the one the first version missed entirely:
+         preset stops do NOT appear in fetch_open_orders, so checking only
+         that endpoint was a guaranteed false negative. In production it made
+         the bot try to flatten a correctly protected position.
+      2. The position payload's own preset fields.
+      3. Ordinary reduce-only resting orders, for a manually placed stop.
+
+    Any one of them counts as protected.
     """
+    trigger_orders = await client.fetch_trigger_orders(symbol)
+    for raw in trigger_orders:
+        if raw.get("symbol") not in (symbol, None):
+            continue
+        if raw.get("reduceOnly") or raw.get("triggerPrice") or raw.get("stopLossPrice"):
+            return True
+        if _has_stop_field(raw.get("info") or {}):
+            return True
+
     raw_positions = await client.fetch_positions()
     for raw in raw_positions:
         if raw.get("symbol") != symbol:
             continue
-        info = raw.get("info") or {}
-        for key in ("presetStopLossPrice", "presetStopLossExecutePrice", "stopLossPrice"):
-            value = info.get(key)
-            if value not in (None, "", "0", 0):
-                return True
+        if _has_stop_field(raw.get("info") or {}):
+            return True
 
     raw_orders = await client.fetch_open_orders()
     for raw in raw_orders:
@@ -193,7 +224,7 @@ async def _has_protection(client: BitgetClient, symbol: str) -> bool:
         info = raw.get("info") or {}
         if str(info.get("reduceOnly", "")).lower() == "yes":
             return True
-        if info.get("planType") in ("loss_plan", "pos_loss", "normal_plan"):
+        if info.get("planType") in ("loss_plan", "pos_loss", "normal_plan", "profit_loss"):
             return True
 
     return False
@@ -211,9 +242,28 @@ async def flatten(
     """
     log.warning("flatten.start", symbol=symbol, reason=reason)
 
-    await _with_retry(
-        lambda: client.cancel_all_orders(symbol), f"cancel_all_orders({symbol})", log, limiter
-    )
+    # Cancelling is BEST EFFORT. Closing the position is the safety-critical
+    # part, and it must not be blocked by housekeeping.
+    #
+    # Production incident: Bitget returned "no order to cancel" (22001) because
+    # a market entry had left nothing resting. The retry wrapper treated that as
+    # a transport failure, exhausted its attempts and raised -- so the market
+    # close below never ran and the bot halted still holding the position.
+    # Whatever happens here, we go on to close.
+    try:
+        await _with_retry(
+            lambda: client.cancel_all_orders(symbol),
+            f"cancel_all_orders({symbol})",
+            log,
+            limiter,
+        )
+    except (ExecutionError, ExchangeError) as exc:
+        log.warning(
+            "flatten.cancel_failed",
+            symbol=symbol,
+            error=str(exc),
+            note="proceeding to close the position anyway",
+        )
 
     position = await _live_position(client, symbol)
     if position is None:
