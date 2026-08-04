@@ -39,14 +39,28 @@ def log():
     return get_logger("test")
 
 
-def ohlcv_row(index: int, o=100.0, h=101.0, low=99.0, c=100.0):
-    return [index * BAR_MS_5M, o, h, low, c, 10.0]
+# The test clock. Bars are laid out relative to it so that the LAST row is the
+# bar still forming at NOW_MS and the one before it is the last closed bar --
+# which is what the venue actually returns, and what the cache filters on.
+NOW_MS = int(datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+ALIGNED_NOW = NOW_MS // BAR_MS_5M * BAR_MS_5M
+
+
+def ohlcv_row(ts_ms: int, o=100.0, h=101.0, low=99.0, c=100.0):
+    return [ts_ms, o, h, low, c, 10.0]
+
+
+def _series(count: int) -> list[list]:
+    """`count` rows ending with the bar that is forming at NOW_MS."""
+    return [
+        ohlcv_row(ALIGNED_NOW - (count - 1 - i) * BAR_MS_5M) for i in range(count)
+    ]
 
 
 @pytest.fixture(scope="module")
 def flat_rows():
     """Enough closed bars to fill the percentile window, plus a forming candle."""
-    return [ohlcv_row(i) for i in range(REQUIRED_BARS + 1)]
+    return _series(REQUIRED_BARS + 1)
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +68,7 @@ def cascade_rows(flat_rows):
     """Same history, but the last CLOSED bar is a 6-point up-cascade."""
     rows = [list(r) for r in flat_rows]
     last_closed = len(rows) - 2
-    rows[last_closed] = ohlcv_row(last_closed, o=100.0, h=106.0, low=100.0, c=106.0)
+    rows[last_closed] = ohlcv_row(rows[last_closed][0], o=100.0, h=106.0, low=100.0, c=106.0)
     return rows
 
 
@@ -69,7 +83,7 @@ def app_config(write_config, valid_config_yaml, tmp_path) -> AppConfig:
 
 def make_state(**overrides) -> AccountState:
     base = dict(
-        fetched_at_ms=int(datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc).timestamp() * 1000),
+        fetched_at_ms=NOW_MS,
         mode="live",
         position_mode="one_way_mode",
         equity=Decimal("1000"),
@@ -420,3 +434,57 @@ async def test_omitting_now_ms_always_refetches(flat_rows, limiter):
     await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
     await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
     assert len(calls) == 2
+
+
+# --- closed-bar discipline --------------------------------------------------
+
+
+def _rows_at(base_ms: int, count: int, tf_ms: int = BAR_MS_5M):
+    return [[base_ms + i * tf_ms, 100.0, 101.0, 99.0, 100.0, 10.0] for i in range(count)]
+
+
+async def test_a_forming_candle_is_never_evaluated(limiter):
+    """
+    The venue's last row is the candle still forming. Its close has not
+    happened, so it must not reach the strategy.
+    """
+    base = 1_700_000_000_000 // BAR_MS_5M * BAR_MS_5M
+    rows = _rows_at(base, 5)                       # bars at T+0..T+4
+    now = base + 4 * BAR_MS_5M + 60_000            # 1 min into the LAST bar
+
+    client = FakeBitgetClient(ohlcv=rows)
+    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", 200, limiter, now)
+
+    assert bars[-1].timestamp_ms == base + 3 * BAR_MS_5M, "evaluated a forming candle"
+
+
+async def test_the_just_closed_bar_is_kept_even_if_the_venue_has_no_new_candle_yet(limiter):
+    """
+    REGRESSION. Dropping the last row by position assumed the venue had already
+    opened the next candle. We refresh within ~20s of a boundary; if Bitget has
+    not opened it yet, the last row IS the bar that just closed and dropping it
+    silently discarded that signal.
+    """
+    base = 1_700_000_000_000 // BAR_MS_5M * BAR_MS_5M
+    rows = _rows_at(base, 4)                       # venue has NOT opened T+4 yet
+    now = base + 4 * BAR_MS_5M + 2_000             # 2s after T+3 closed
+
+    client = FakeBitgetClient(ohlcv=rows)
+    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", 200, limiter, now)
+
+    assert bars[-1].timestamp_ms == base + 3 * BAR_MS_5M, \
+        "lost the bar that had just closed"
+
+
+async def test_a_bar_is_evaluated_exactly_once(cascade_rows, app_config, limiter, log):
+    """Re-evaluating the same closed bar would re-enter on a stale cross."""
+    client = FakeBitgetClient(ohlcv=cascade_rows)
+    trader = Trader()
+    state = make_state()
+
+    first = await scan_for_signal(client, app_config, state, trader, log, limiter)
+    second = await scan_for_signal(client, app_config, state, trader, log, limiter)
+    third = await scan_for_signal(client, app_config, state, trader, log, limiter)
+
+    assert first is not None
+    assert second is None and third is None

@@ -156,10 +156,23 @@ class BarCache:
         if not rows:
             return self._bars.get(key, [])
 
-        # The final row is the FORMING candle. Both strategies are defined on
-        # closed bars only; acting on a forming bar means acting on a close that
-        # has not happened.
-        incoming = [Bar.from_ccxt(row) for row in rows[:-1]]
+        # Keep CLOSED bars only. Both strategies are defined on closed bars;
+        # acting on a forming one means acting on a close that has not happened.
+        #
+        # A bar stamped T covers [T, T+bar_ms) and is closed once now >= T+bar_ms.
+        # Deciding by timestamp rather than by position is what makes this
+        # correct: simply dropping the last row assumes the venue has already
+        # opened the next candle. We refresh within ~20s of a boundary, and if
+        # Bitget has not opened the new candle yet, the last row IS the bar that
+        # just closed -- dropping it would silently discard that signal until the
+        # following bar, by which point the cross is stale and ignored.
+        all_bars = [Bar.from_ccxt(row) for row in rows]
+        if now_ms is not None:
+            bar_ms = timeframe_to_ms(timeframe)
+            incoming = [b for b in all_bars if b.timestamp_ms + bar_ms <= now_ms]
+        else:
+            # No clock supplied: fall back to assuming the last row is forming.
+            incoming = all_bars[:-1]
 
         merged: dict[int, Bar] = {b.timestamp_ms: b for b in self._bars.get(key, [])}
         for candle in incoming:
