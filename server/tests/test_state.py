@@ -145,6 +145,24 @@ def test_redaction_scrubs_secret_keys(key):
     assert out["event"] == "x"
 
 
+@pytest.mark.parametrize("key", ["signal", "signal_bar_ts", "signals"])
+def test_diagnostic_keys_are_not_over_redacted(key):
+    """
+    'signal' contains 'sign', which was scrubbing the OS signal number out of
+    shutdown logs and the strategy's signal description. Over-redaction is the
+    safe direction but it still destroys the diagnostics you need at 3am.
+    """
+    out = redact_secrets(None, None, {key: "SIGTERM", "event": "x"})
+    assert out[key] == "SIGTERM"
+
+
+def test_real_signature_keys_are_still_redacted():
+    """The loosening must not have opened a hole."""
+    for key in ("sign", "signature", "ACCESS-SIGN", "req_sign"):
+        out = redact_secrets(None, None, {key: "SECRETSIG"})
+        assert out[key] == "<redacted>", f"{key} leaked"
+
+
 def test_redaction_reaches_nested_structures():
     event = {
         "event": "request",

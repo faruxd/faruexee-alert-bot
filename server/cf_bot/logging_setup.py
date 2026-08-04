@@ -40,9 +40,27 @@ _SECRET_KEY_SUBSTRINGS = (
 
 _REDACTED = "<redacted>"
 
+# Keys that must NEVER be redacted despite matching a substring above.
+#
+# "signal" contains "sign", so the OS signal number in shutdown logs was being
+# scrubbed -- you could not tell SIGTERM from SIGINT. Over-redaction is much
+# safer than under-redaction, but it still destroys diagnostics, so known-safe
+# keys are listed explicitly rather than by loosening the substring rules.
+_NEVER_REDACT = frozenset(
+    {
+        "signal",
+        "signal_bar_ts",
+        "signals",
+        "design",
+        "assigned",
+    }
+)
+
 
 def _looks_secret(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _NEVER_REDACT:
+        return False
     return any(needle in lowered for needle in _SECRET_KEY_SUBSTRINGS)
 
 
