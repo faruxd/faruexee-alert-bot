@@ -52,6 +52,28 @@ HEDGE_POSITION_MODE = "hedge_mode"
 # near-match than run with a key that can move funds off the exchange.
 FORBIDDEN_AUTHORITY_SUBSTRINGS = frozenset({"withdraw", "transfer"})
 
+# Authority names we actually recognise. Anything outside this set is logged as
+# UNVERIFIED rather than silently treated as safe.
+#
+# This matters: a live account returned ["coow", "cpow"] -- undocumented codes
+# that appear nowhere in Bitget's published permission vocabulary. The forbidden
+# substring check passed, but it passed vacuously: it found no "withdraw" only
+# because it does not know what these codes mean. A check that cannot fail is
+# not a check, so the operator is now told to verify in the UI instead of being
+# shown a green light that was never earned.
+KNOWN_SAFE_AUTHORITIES = frozenset(
+    {
+        "readonly",
+        "read_only",
+        "read",
+        "trade",
+        "spot_trade",
+        "margin_trade",
+        "contract_trade",
+        "futures_trade",
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Kill switch
 # ---------------------------------------------------------------------------

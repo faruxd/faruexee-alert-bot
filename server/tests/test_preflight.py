@@ -8,6 +8,7 @@ from cf_bot.preflight import (
     PreflightError,
     assert_cannot_withdraw,
     assert_one_way_position_mode,
+    unrecognised_authorities,
 )
 from tests.conftest import FakeBitgetClient
 
@@ -71,6 +72,41 @@ async def test_empty_permission_list_is_refused():
     with pytest.raises(PreflightError) as exc:
         await assert_cannot_withdraw(client)
     assert "empty permission list" in str(exc.value)
+
+
+def test_documented_authorities_are_recognised():
+    assert unrecognised_authorities(("readonly", "trade")) == ()
+    assert unrecognised_authorities(("read_only", "contract_trade")) == ()
+
+
+def test_undocumented_authorities_are_reported():
+    """
+    A real account returned ["coow", "cpow"] -- codes absent from Bitget's
+    published vocabulary. The forbidden-substring check passes on those, but
+    only because it cannot interpret them. They must be surfaced, not treated
+    as a clean bill of health.
+    """
+    assert unrecognised_authorities(("coow", "cpow")) == ("coow", "cpow")
+
+
+def test_mixed_authorities_report_only_the_unknown_ones():
+    assert unrecognised_authorities(("readonly", "coow")) == ("coow",)
+
+
+async def test_undocumented_authorities_still_start_the_bot():
+    """
+    Not fatal. The bot has no withdrawal code path, so an over-permissioned key
+    is a custody risk the operator must judge, not something this process can
+    act on. It warns rather than refusing to run.
+    """
+    client = FakeBitgetClient(authorities=("coow", "cpow"))
+    assert await assert_cannot_withdraw(client) == ("coow", "cpow")
+
+
+async def test_an_undocumented_code_containing_withdraw_is_still_refused():
+    client = FakeBitgetClient(authorities=("coow", "wd_withdraw_own"))
+    with pytest.raises(PreflightError):
+        await assert_cannot_withdraw(client)
 
 
 async def test_permission_lookup_failure_is_refused(exchange_error):

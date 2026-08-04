@@ -15,6 +15,7 @@ from __future__ import annotations
 from cf_bot.constants import (
     FORBIDDEN_AUTHORITY_SUBSTRINGS,
     HEDGE_POSITION_MODE,
+    KNOWN_SAFE_AUTHORITIES,
     REQUIRED_POSITION_MODE,
 )
 from cf_bot.exchange import BitgetClient, ExchangeError
@@ -96,6 +97,23 @@ async def assert_cannot_withdraw(client: BitgetClient) -> tuple[str, ...]:
     return authorities
 
 
+def unrecognised_authorities(authorities: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    Authority names outside Bitget's documented vocabulary.
+
+    Bitget has been observed returning undocumented codes such as 'coow' and
+    'cpow'. When that happens the forbidden-substring check above proves
+    nothing -- it finds no 'withdraw' only because it cannot interpret the
+    values at all. The caller surfaces these so the operator verifies the key's
+    permissions in the UI rather than trusting a check that could not have
+    failed.
+
+    Not fatal: the bot has no withdrawal code path, so an over-permissioned key
+    is a key-custody risk rather than something this process can act on.
+    """
+    return tuple(a for a in authorities if a.strip().lower() not in KNOWN_SAFE_AUTHORITIES)
+
+
 async def run_all(client: BitgetClient, log) -> dict:
     """
     Run every preflight assertion in order. Raises PreflightError on the first failure.
@@ -108,7 +126,21 @@ async def run_all(client: BitgetClient, log) -> dict:
     log.info("preflight.position_mode_ok", position_mode=position_mode)
 
     authorities = await assert_cannot_withdraw(client)
-    log.info("preflight.permissions_ok", authorities=list(authorities))
+    unknown = unrecognised_authorities(authorities)
+    if unknown:
+        log.warning(
+            "preflight.permissions_unverified",
+            authorities=list(authorities),
+            unrecognised=list(unknown),
+            note=(
+                "These permission codes are not in Bitget's documented vocabulary, so "
+                "the no-withdrawal check could not actually verify anything -- it found "
+                "no 'withdraw' only because it cannot interpret these values. VERIFY IN "
+                "THE BITGET UI that this key has Read + Trade only."
+            ),
+        )
+    else:
+        log.info("preflight.permissions_ok", authorities=list(authorities))
 
     log.info("preflight.passed")
     return {"position_mode": position_mode, "authorities": list(authorities)}
