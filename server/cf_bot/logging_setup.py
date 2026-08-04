@@ -36,6 +36,9 @@ _SECRET_KEY_SUBSTRINGS = (
     "authorization",
     "access-key",
     "access_key",
+    # A Discord webhook URL is a credential: anyone holding it can post to the
+    # channel. It must never reach a log line.
+    "webhook",
 )
 
 _REDACTED = "<redacted>"

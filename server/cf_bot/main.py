@@ -36,6 +36,12 @@ from cf_bot.constants import (
 from cf_bot.exchange import BitgetClient, DemoModeRefusal, ExchangeError
 from cf_bot.killswitch import kill_file_present
 from cf_bot.logging_setup import configure_logging, get_logger
+from cf_bot.notify import (
+    DiscordNotifier,
+    critical_message,
+    position_closed_message,
+    position_opened_message,
+)
 from cf_bot.orders import ExecutionError, RateLimiter, UnprotectedPositionError, flatten
 from cf_bot.preflight import PreflightError, run_all as run_preflight
 from cf_bot.reconcile import ReconcileError, reconcile
@@ -75,6 +81,7 @@ async def _engage_kill_switch(
     log,
     limiter: RateLimiter,
     kill_file: Path,
+    notifier: Optional["DiscordNotifier"] = None,
 ) -> int:
     """
     Cancel every order, flatten every position, exit.
@@ -110,10 +117,71 @@ async def _engage_kill_switch(
             failures=failures,
             note="close these by hand in the Bitget UI",
         )
+        if notifier is not None:
+            await notifier.send(
+                critical_message(
+                    "KILL SWITCH — COULD NOT FLATTEN EVERYTHING",
+                    "\n".join(failures) + "\n\nClose these by hand in the Bitget UI.",
+                ),
+                allow_duplicate=True,
+            )
     else:
         log.error("killswitch.all_clear", note="all orders cancelled and positions flat")
+        if notifier is not None:
+            await notifier.send(
+                critical_message(
+                    "KILL SWITCH ENGAGED", "All orders cancelled, all positions flat. Bot stopped."
+                ),
+                allow_duplicate=True,
+            )
 
     return EXIT_KILL_SWITCH
+
+
+def _position_key(position) -> tuple[str, str]:
+    return (position.symbol, position.side)
+
+
+async def _notify_position_changes(
+    notifier: DiscordNotifier,
+    previous: Optional[AccountState],
+    current: AccountState,
+    log,
+) -> None:
+    """
+    Announce positions that appeared or disappeared between two snapshots.
+
+    Diffing reconciled state rather than hooking the entry path is deliberate:
+    it catches every position however it arose -- placed by the bot, filled from
+    a resting order between iterations, or opened by hand in the Bitget UI.
+
+    Never raises. A notification problem must not disturb the trading loop.
+    """
+    if previous is None:
+        return
+
+    before = {_position_key(p): p for p in previous.live_positions}
+    after = {_position_key(p): p for p in current.live_positions}
+
+    for key in after.keys() - before.keys():
+        position = after[key]
+        log.info("notify.position_opened", position=position.describe())
+        await notifier.send(
+            position_opened_message(position, current.mode, current.equity)
+        )
+
+    for key in before.keys() - after.keys():
+        symbol, side = key
+        # Realised PnL comes from the exchange's own closed-position history,
+        # not from anything we computed.
+        realised = None
+        for closed in current.todays_closed_positions:
+            if closed.symbol == symbol:
+                realised = closed.realised_pnl
+        log.info("notify.position_closed", symbol=symbol, side=side)
+        await notifier.send(
+            position_closed_message(symbol, side, realised, current.equity)
+        )
 
 
 async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
@@ -124,6 +192,7 @@ async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
     client = BitgetClient(credentials, config.settings, config.mode)
     limiter = RateLimiter()
     trader = Trader()
+    notifier = DiscordNotifier.from_env(log)
     last_state: Optional[AccountState] = None
 
     try:
@@ -161,7 +230,7 @@ async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
         while not shutdown.is_set():
             if kill_file_present(config.kill_file):
                 return await _engage_kill_switch(
-                    client, last_state, log, limiter, config.kill_file
+                    client, last_state, log, limiter, config.kill_file, notifier
                 )
 
             try:
@@ -174,6 +243,7 @@ async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
                 await _sleep_or_shutdown(shutdown, config.settings.runtime.loop_interval_seconds)
                 continue
 
+            await _notify_position_changes(notifier, last_state, state, log)
             last_state = state
 
             comparable = state.comparable()
@@ -192,6 +262,13 @@ async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
                     "fatal.unprotected_position",
                     error=str(exc),
                     action="halting; the exchange holds a position we could not protect or close",
+                )
+                await notifier.send(
+                    critical_message(
+                        "UNPROTECTED POSITION — BOT HALTED",
+                        f"{exc}\n\nCheck the account in the Bitget UI now.",
+                    ),
+                    allow_duplicate=True,
                 )
                 return EXIT_UNPROTECTED_POSITION
             except ExecutionError as exc:
