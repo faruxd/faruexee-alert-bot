@@ -202,6 +202,34 @@ def day_start_equity(current_equity: Decimal, todays_realised: Decimal) -> Decim
 # ---------------------------------------------------------------------------
 
 
+def guard_position_history_sane(ctx: GuardContext) -> GuardVerdict:
+    """
+    Refuse to trade when the exchange's own answers contradict each other.
+
+    The daily entry cap AND the daily loss limit are both derived entirely from
+    todays_closed_positions. If that list comes back empty when it should not
+    be, both guards silently pass -- they fail OPEN, which is the opposite of
+    this module's whole contract.
+
+    That happened: a ccxt quirk made the history query return only the first
+    configured symbol, so a day of LTC, PEPE and UNI closes read as zero. The
+    bot traded past both its entry cap and its loss limit with no complaint.
+
+    Fills today with nothing closed and nothing open is impossible -- a fill
+    either opened a position or closed one. Seeing it means the history feed is
+    lying, and the correct response is to stop rather than to trade on numbers
+    known to be wrong.
+    """
+    live = [p for p in ctx.positions if p.contracts > 0]
+    if ctx.todays_fills and not ctx.todays_closed_positions and not live:
+        return GuardVerdict.block(
+            f"{len(ctx.todays_fills)} fills today but position history reports nothing "
+            "closed and nothing open -- the daily entry cap and loss limit are both "
+            "derived from that history, so they cannot be trusted right now"
+        )
+    return GuardVerdict.allow()
+
+
 def guard_max_concurrent_positions(ctx: GuardContext) -> GuardVerdict:
     live = [p for p in ctx.positions if p.contracts > 0]
     if len(live) >= MAX_CONCURRENT_POSITIONS:
@@ -279,6 +307,9 @@ def guard_settlement_blackout(ctx: GuardContext) -> GuardVerdict:
 
 
 ALL_GUARDS = (
+    # Data-integrity first: if the exchange's answers contradict each other,
+    # every guard below is evaluating numbers we know are wrong.
+    guard_position_history_sane,
     guard_max_concurrent_positions,
     guard_max_entries_per_day,
     guard_max_orders_per_hour,

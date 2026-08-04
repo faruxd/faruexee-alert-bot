@@ -331,6 +331,7 @@ def test_every_guard_is_covered_by_this_file():
     that a check rather than a hope.
     """
     tested = {
+        "guard_position_history_sane",
         "guard_max_concurrent_positions",
         "guard_max_entries_per_day",
         "guard_max_orders_per_hour",
@@ -339,3 +340,49 @@ def test_every_guard_is_covered_by_this_file():
     }
     actual = {g.__name__ for g in guards.ALL_GUARDS}
     assert actual == tested, f"untested guards: {actual - tested}"
+
+
+# --- data integrity --------------------------------------------------------
+
+
+def test_fills_with_no_closed_and_no_open_positions_blocks():
+    """
+    REGRESSION. ccxt's bitget fetch_positions_history uses only symbols[0], so
+    passing 20 symbols queried BTC alone. A day of LTC/PEPE/UNI closes read as
+    zero, which emptied the data BOTH the entry cap and the loss limit derive
+    from -- so both failed OPEN and the bot traded past its limits.
+
+    Fills today with nothing closed and nothing open is impossible. It means
+    the history feed is lying, and the answer is to stop.
+    """
+    ctx = make_ctx(todays_fills=(make_fill(),), todays_closed_positions=(), positions=())
+    verdict = guards.guard_position_history_sane(ctx)
+    assert verdict.allowed is False
+    assert "cannot be trusted" in verdict.reason
+
+
+def test_fills_with_an_open_position_are_consistent():
+    """Mid-trade: fills exist, nothing closed yet, one position open. Fine."""
+    ctx = make_ctx(
+        todays_fills=(make_fill(),), todays_closed_positions=(), positions=(make_position(),)
+    )
+    assert guards.guard_position_history_sane(ctx).allowed is True
+
+
+def test_fills_with_a_closed_position_are_consistent():
+    ctx = make_ctx(todays_fills=(make_fill(),), todays_closed_positions=(make_closed("-1"),))
+    assert guards.guard_position_history_sane(ctx).allowed is True
+
+
+def test_a_quiet_day_with_no_fills_is_consistent():
+    assert guards.guard_position_history_sane(make_ctx()).allowed is True
+
+
+def test_the_integrity_check_runs_before_the_limits():
+    """
+    It must come first. The guards after it are evaluating numbers derived from
+    the very data it is checking.
+    """
+    names = [g.__name__ for g in guards.ALL_GUARDS]
+    assert names[0] == "guard_position_history_sane"
+    assert names.index("guard_position_history_sane") < names.index("guard_daily_loss_limit")

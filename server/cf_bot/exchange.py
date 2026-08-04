@@ -309,8 +309,28 @@ class BitgetClient:
         self._require_connected()
         since = utc_day_start_ms(now)
         try:
+            # symbols=None ON PURPOSE. ccxt's bitget implementation uses ONLY
+            # symbols[0] to build the request:
+            #
+            #     if symbols is not None:
+            #         if symbolsLength > 0:
+            #             market = self.market(symbols[0])
+            #             request['symbol'] = market['id']
+            #
+            # Passing our 20 symbols therefore queried BTC alone and returned
+            # nothing on a day whose closes were LTC, PEPE and UNI. That emptied
+            # todays_closed_positions, which BOTH the daily entry cap and the
+            # daily loss limit are derived from -- so both silently passed and
+            # the bot traded past its limits.
+            #
+            # With symbols=None no symbol filter is sent and the venue returns
+            # every closed position for the product type, in one request.
+            # `market` is pre-initialised to None in ccxt, so this is safe.
             return await self._exchange.fetch_positions_history(
-                list(self._symbols), since=since
+                None,
+                since=since,
+                limit=100,  # ccxt default is 20; 100 is the venue maximum
+                params={"productType": self._settings.exchange.product_type},
             )
         except Exception as exc:
             raise ExchangeError(f"fetch_positions_history failed: {exc}") from exc
