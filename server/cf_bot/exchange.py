@@ -400,6 +400,51 @@ class BitgetClient:
         except Exception as exc:
             raise ExchangeError(f"entry submission failed for {symbol}: {exc}") from exc
 
+    async def create_market_entry_with_protection(
+        self,
+        symbol: str,
+        side: str,
+        amount: Decimal,
+        stop_price: Decimal,
+        take_profit_price: Decimal,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        """
+        Market entry with the stop and target PRESET onto the order.
+
+        The fallback leg for the scalper: used only when a passive limit failed
+        to fill inside its window. Pays taker, so the caller should treat every
+        use of this as a real cost, not a free convenience.
+
+        Protection is still attached by the venue at fill time -- there is no
+        variant of entry in this codebase that leaves a position bare.
+        """
+        self._require_connected()
+        self._require_trading_enabled(f"place a market entry on {symbol}")
+
+        params: dict[str, Any] = {
+            "clientOid": client_order_id,
+            "stopLoss": {"triggerPrice": float(self.price_to_precision(symbol, stop_price))},
+            "takeProfit": {
+                "triggerPrice": float(self.price_to_precision(symbol, take_profit_price))
+            },
+        }
+        ccxt_side = "buy" if side == "long" else "sell"
+
+        try:
+            return await self._exchange.create_order(
+                symbol,
+                "market",
+                ccxt_side,
+                float(self.amount_to_precision(symbol, amount)),
+                None,
+                params,
+            )
+        except _FINAL_REJECTION_TYPES as exc:
+            raise OrderRejected(f"market entry rejected for {symbol}: {exc}") from exc
+        except Exception as exc:
+            raise ExchangeError(f"market entry failed for {symbol}: {exc}") from exc
+
     async def create_reduce_only_market(
         self, symbol: str, side: str, amount: Decimal, client_order_id: str
     ) -> dict[str, Any]:

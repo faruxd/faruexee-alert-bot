@@ -124,7 +124,7 @@ async def test_cache_drops_the_forming_candle(flat_rows, limiter):
     acting on a close that has not happened.
     """
     client = FakeBitgetClient(ohlcv=flat_rows)
-    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", limiter)
+    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
 
     assert len(bars) == len(flat_rows) - 1
     assert bars[-1].timestamp_ms == flat_rows[-2][0]
@@ -148,8 +148,8 @@ async def test_cache_fetches_full_history_then_tops_up(flat_rows, limiter):
     client.fetch_ohlcv = record
     cache = BarCache()
 
-    await cache.refresh(client, "BTC/USDT:USDT", "5m", limiter)
-    await cache.refresh(client, "BTC/USDT:USDT", "5m", limiter)
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
 
     assert requested[0] == REQUIRED_BARS
     assert requested[1] == REFRESH_BARS
@@ -157,15 +157,15 @@ async def test_cache_fetches_full_history_then_tops_up(flat_rows, limiter):
 
 async def test_cache_is_capped(flat_rows, limiter):
     client = FakeBitgetClient(ohlcv=flat_rows)
-    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", limiter)
+    bars = await BarCache().refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
     assert len(bars) <= REQUIRED_BARS
 
 
 async def test_cache_merges_without_duplicating(flat_rows, limiter):
     client = FakeBitgetClient(ohlcv=flat_rows)
     cache = BarCache()
-    first = await cache.refresh(client, "BTC/USDT:USDT", "5m", limiter)
-    second = await cache.refresh(client, "BTC/USDT:USDT", "5m", limiter)
+    first = await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
+    second = await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
 
     assert len(first) == len(second)
     timestamps = [b.timestamp_ms for b in second]
@@ -174,7 +174,7 @@ async def test_cache_merges_without_duplicating(flat_rows, limiter):
 
 async def test_empty_response_leaves_the_cache_intact(limiter):
     client = FakeBitgetClient(ohlcv=[])
-    assert await BarCache().refresh(client, "BTC/USDT:USDT", "5m", limiter) == []
+    assert await BarCache().refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter) == []
 
 
 # --- re-evaluation gating --------------------------------------------------

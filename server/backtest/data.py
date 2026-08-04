@@ -108,6 +108,50 @@ def save_csv(bars: list[Bar], path: Path) -> None:
             )
 
 
+def resample(bars: list[Bar], factor: int) -> list[Bar]:
+    """
+    Aggregate `factor` consecutive bars into one (5m -> 15m at factor 3).
+
+    Buckets are aligned to wall-clock boundaries of the TARGET timeframe, not to
+    the start of the array. Aligning to the array would produce 15m bars at
+    07:05, 07:20, ... which is not what the exchange's own 15m series looks
+    like, and the trend filter would be reading different candles live than in
+    the backtest.
+
+    Only COMPLETE buckets are emitted. A partial trailing bucket is the
+    equivalent of a forming candle and must not be evaluated.
+    """
+    if factor < 1:
+        raise ValueError(f"resample factor must be >= 1, got {factor}")
+    if factor == 1:
+        return list(bars)
+    if not bars:
+        return []
+
+    target_ms = BAR_MS_5M * factor
+    buckets: dict[int, list[Bar]] = {}
+    for candle in bars:
+        bucket_ts = (candle.timestamp_ms // target_ms) * target_ms
+        buckets.setdefault(bucket_ts, []).append(candle)
+
+    out: list[Bar] = []
+    for bucket_ts in sorted(buckets):
+        group = sorted(buckets[bucket_ts], key=lambda b: b.timestamp_ms)
+        if len(group) != factor:
+            continue  # incomplete bucket
+        out.append(
+            Bar(
+                timestamp_ms=bucket_ts,
+                open=group[0].open,
+                high=max(b.high for b in group),
+                low=min(b.low for b in group),
+                close=group[-1].close,
+                volume=sum((b.volume for b in group), Decimal(0)),
+            )
+        )
+    return out
+
+
 def check_continuity(bars: list[Bar], expected_gap_ms: int = BAR_MS_5M) -> list[str]:
     """
     Report gaps in the series.

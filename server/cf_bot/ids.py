@@ -25,8 +25,21 @@ PURPOSE_ENTRY = "e"
 PURPOSE_STOP = "s"
 PURPOSE_TARGET = "t"
 PURPOSE_FLATTEN = "f"
+# The market fallback leg of a limit-then-market entry. A DISTINCT purpose, so
+# it derives a different id from the limit leg it replaces -- otherwise the
+# venue would reject the fallback as a duplicate of the order we just cancelled.
+PURPOSE_ENTRY_MARKET = "m"
 
-_ALL_PURPOSES = (PURPOSE_ENTRY, PURPOSE_STOP, PURPOSE_TARGET, PURPOSE_FLATTEN)
+_ALL_PURPOSES = (
+    PURPOSE_ENTRY,
+    PURPOSE_STOP,
+    PURPOSE_TARGET,
+    PURPOSE_FLATTEN,
+    PURPOSE_ENTRY_MARKET,
+)
+
+# Both legs of an entry count as an entry for the daily counter.
+_ENTRY_PURPOSES = (PURPOSE_ENTRY, PURPOSE_ENTRY_MARKET)
 
 
 def client_order_id(symbol: str, signal_bar_ts: int, side: str, purpose: str) -> str:
@@ -65,4 +78,12 @@ def purpose_of(client_oid: str | None) -> str | None:
 
 
 def is_entry(client_oid: str | None) -> bool:
-    return purpose_of(client_oid) == PURPOSE_ENTRY
+    """
+    True for either leg of an entry.
+
+    A limit-then-market entry mints two ids, but only one of them can ever
+    fill -- the market leg is sent only after the limit leg was cancelled
+    unfilled. In the rare case both appear in a day's fills, the daily counter
+    over-counts by one, which blocks trading earlier rather than later.
+    """
+    return purpose_of(client_oid) in _ENTRY_PURPOSES

@@ -1,8 +1,15 @@
-# cf_bot — "Forced Flow" (CF)
+# cf_bot
 
-Bitget USDT-M perpetual futures bot. All five phases built.
+Bitget USDT-M perpetual futures bot. Two strategies share one safety layer; `strategy.name` in `config.yaml` selects which runs.
 
-**Thesis:** perp liquidation engines submit price-insensitive market orders. Cascades overshoot fair value and revert once the forced flow exhausts. We fade the overshoot.
+| | **ema_scalper** (default) | **forced_flow** |
+|---|---|---|
+| Idea | Trade with the 15m trend on a 5m EMA cross | Fade liquidation-cascade overshoot |
+| Entry | Passive limit, **market fallback** after 25s | Post-only limit, never chases |
+| Stop | 1.5 × ATR(14) | 1.25 × ATR beyond the cascade bar's extreme |
+| Target | 2R | The level the cascade started from |
+| Time stop | 24 bars (2h) | 12 bars (1h) |
+| Warm-up | 60 bars | **8,640 bars (30 days)** |
 
 ---
 
@@ -13,50 +20,52 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Credentials come from the environment and nowhere else — the bot does not parse `.env`. See `.env.example`.
-
 ```bash
-python -m cf_bot          # live bot
-python -m backtest --symbol BTC/USDT:USDT --days 180
-python -m pytest          # 324 tests, no network
+python -m cf_bot                                          # live bot
+python -m backtest --symbol BTC/USDT:USDT --days 90       # scalper backtest
+python -m pytest                                          # 382 tests, no network
 ```
 
-Deployment: **[DEPLOY_RENDER.md](DEPLOY_RENDER.md)** — read the worker-vs-web-service section before deploying.
+Credentials come from the environment only — the bot does not parse `.env`. See `.env.example`.
+Deployment: **[DEPLOY_RENDER.md](DEPLOY_RENDER.md)**.
 
 ---
 
-## The strategy
+## ema_scalper
 
-Three tunable parameters. There is no fourth, there are no indicators, and there is no signal-strength position scaling.
+**15m EMA(50)** sets direction — longs only above it, shorts only below. A **5m EMA(9)/EMA(21) cross** in that direction triggers the entry, and only on the bar where the cross actually happens (a cross three bars ago is already priced in).
 
-| Param | Meaning | Default |
-|---|---|---|
-| `k` | Displacement threshold (ATR units) | 2.5 |
-| `s` | Stop distance (ATR units) | 1.25 |
-| `p` | ATR percentile floor | 30 |
+Stop is 1.5 × ATR(14) on the 5m, preset on the exchange. Target is 2R. Flat at market after 24 bars.
 
-Fixed by convention, not tunable: ATR period 14, percentile lookback 30d, entry valid 3 bars, time stop 12 bars.
+### Why the stop is wide, and why that matters more than it looks
 
-On the close of bar `i`, with `D = close[i] - open[i]`:
+Position size is `equity × risk / stop_distance`, and fees are charged on **notional**. A tighter stop means a bigger position, which means more fees for the same 1% of risk:
 
-- `D >= k*ATR[i-1]` → **short** setup; `D <= -k*ATR[i-1]` → **long** setup
-- Entry: post-only limit at `close[i]`, valid bars `i+1..i+3`
-- Stop: `low[i] - s*ATR` (long) / `high[i] + s*ATR` (short), preset on the exchange
-- Target: `open[i]` — where the cascade started
-- Time stop: flatten at market on the close of `entry_bar + 12`
+| Stop distance | Notional | Taker round trip | Cost per trade |
+|---|---|---|---|
+| 0.2% | 5.0× equity | 0.60% of equity | **0.60R** |
+| 0.3% | 3.3× equity | 0.40% of equity | **0.40R** |
+| 0.6% | 1.7× equity | 0.20% of equity | **0.20R** |
+| 1.0% | 1.0× equity | 0.12% of equity | **0.12R** |
 
-**Regime filter** — all three must pass or the system is off:
-1. `ATR[i-1]` within the [p-th, 90th] percentile of the **trailing** 30 days of 5m ATR
-2. `abs(last settled funding) <= 0.10%` per 8h
-3. Not inside a settlement blackout
+At a 0.3% stop, every round trip costs 0.40R before the market moves at all. **Do not lower `atr_mult` without redoing this arithmetic.**
+
+### The two-leg entry
+
+You asked for market entry because limit orders don't fill. Paying taker on every entry is expensive, so the entry does both:
+
+1. Rest a post-only limit at the signal bar's close (**0.020% maker**)
+2. If unfilled after `entry_limit_timeout_seconds`, cancel and take it at market (**0.060% taker**)
+
+Post-only rejection — price already moved through the level — skips straight to step 2. Both legs carry the stop and target as presets, so neither can leave a position bare, and they use **different** deterministic order IDs so the fallback isn't rejected as a duplicate of the order just cancelled.
 
 ---
 
-## Risk model
+## Risk model (both strategies)
 
-`risk_pct` is **1.0 = 1%**, and `MAX_RISK_PCT` in `constants.py` is also in percent. Same unit, compared directly, no conversion anywhere — a fraction-vs-percent slip is a 100× sizing error.
+`risk_pct` is **1.0 = 1%**, and `MAX_RISK_PCT` is also in percent — same unit, compared directly, no conversion anywhere.
 
-**One position at a time, across all symbols.** The eight configured symbols widen the search for a signal; they do not multiply risk. Per-symbol limits would put 8% at risk simultaneously and breach the −2% daily loss limit on the first two losers.
+**One position at a time, across all symbols.** The eight symbols widen the search for a signal; they do not multiply risk.
 
 | Guard | Limit |
 |---|---|
@@ -68,70 +77,66 @@ On the close of bar `i`, with `D = close[i] - open[i]`:
 | Settlement blackout | ±15 min of 00:00 / 08:00 / 16:00 UTC |
 | Pre-settlement flatten | 2 min before |
 
-Every guard is a pure function over exchange-derived data. **A restart does not reset any counter** — the daily entry count comes from fills, the loss limit and streak from closed-position history. There is no state file.
+Every guard is a pure function over exchange-derived data. **A restart resets no counter** — the daily entry count comes from fills, the loss limit and streak from closed-position history. No state file exists.
 
 ---
 
-## Safety properties, and where they live
+## Safety properties
 
 | Property | Enforced in |
 |---|---|
 | `live` is never a fallback; needs an explicit confirmation env var | `config.py: resolve_mode` |
 | 1% risk ceiling, not configurable | `constants.py: MAX_RISK_PCT` |
 | Demo cannot transmit an order — refused before a request is built | `exchange.py: _require_trading_enabled` |
-| Credentials from env only, never rendered in a repr or traceback | `config.py: Credentials.__repr__` |
+| Credentials never rendered in a repr or traceback | `config.py: Credentials.__repr__` |
 | Secrets scrubbed from every log line | `logging_setup.py: redact_secrets` |
-| One-way position mode required | `preflight.py` |
-| Key proven unable to withdraw or transfer | `preflight.py` |
+| One-way mode and no-withdraw key required | `preflight.py` |
 | Exchange is authoritative; nothing persisted | `reconcile.py` |
-| All-or-nothing snapshots, never partial | `reconcile.py: reconcile` |
-| Stop preset on the entry order — no unprotected window | `exchange.py: create_entry_with_protection` |
-| Fill without protection → flatten immediately at market | `orders.py: place_entry_with_protection` |
-| Deterministic client order IDs — a timeout retry cannot duplicate | `ids.py` |
+| Stop preset on the entry order — no unprotected window | `exchange.py` |
+| Fill without protection → flatten immediately at market | `orders.py: _verify_or_flatten` |
+| Deterministic order IDs — a timeout retry cannot duplicate | `ids.py` |
+| Unfilled entries aged out by exchange timestamp | `orders.py: cancel_expired_entries` |
 | Kill switch fails closed if unreadable | `killswitch.py` |
-| No blocking sleep in the loop | `main.py: _sleep_or_shutdown` |
 
-There is **no in-memory stop-loss monitoring** anywhere in this codebase. The exchange holds the stop.
+There is **no in-memory stop-loss monitoring** anywhere. The exchange holds the stop.
 
 ---
 
 ## Backtester
 
-Imports the *same* `evaluate()` the live bot calls — the strategy is never reimplemented, only driven — and replicates the live guards, because a backtest that ignores them measures a strategy the bot will never run.
-
-The fill model is the important part:
-
-- A post-only limit at P fills **only if a later bar trades through P**. Never because the signal bar touched it — the signal bar's close *is* P.
-- A touch is not a fill. `high == limit` means you were at the back of the queue.
-- Stops fill at trigger **+3 bps adverse slippage**. A stop is a market order fired into the move.
-- When a bar could have hit both stop and target, the **stop** is taken.
-- Fees: maker 0.020%, taker 0.060% (Bitget VIP 0, verified).
+Imports the *same* strategy functions the live bot calls, and replicates the live guards.
 
 ```bash
-python -m backtest --symbol BTC/USDT:USDT --days 180 --save data/btc.csv
-python -m backtest --csv data/btc.csv --symbol BTC/USDT:USDT
+python -m backtest --symbol BTC/USDT:USDT --days 90                    # scalper
+python -m backtest --symbol BTC/USDT:USDT --days 180 --strategy forced_flow
+python -m backtest --csv data/btc.csv --symbol BTC/USDT:USDT           # offline
 ```
 
-Two honesty notes the report prints for you: `--funding 0` (the default) assumes funding was always benign, which is optimistic; and the 30-day warm-up consumes the first 8,640 bars, so `--days 180` gives roughly 150 days of actual testing.
+**Scalper fills are modelled as always market, at the next bar's open, always taker, plus 3 bps slippage.** Live, the passive leg fills some of the time at maker, so real fees should land below this. The result is a **floor, not a forecast**.
 
-**Do not loop this over a parameter grid.** Walk-forward is a separate step run by a human. A grid search here is curve fitting and will not survive live.
+The 15m trend series is resampled from the same 5m data, aligned to wall-clock 15m boundaries, and a 15m bar is only visible once it has closed — reading a forming one would be lookahead.
+
+**Forced flow fills** are stricter: a post-only limit fills only if a *later* bar trades *through* it, a touch is not a fill, stops fill at trigger +3 bps, and when a bar could have hit both stop and target the stop wins.
+
+Fees: maker 0.020%, taker 0.060% (Bitget VIP 0, verified).
+
+**Do not loop this over a parameter grid.** Walk-forward is a separate step run by a human.
 
 ---
 
-## Verified against live sources
+## Before you deploy
 
-Field names were confirmed against current Bitget v2 docs and ccxt 4.5.70's generated method table, not recalled from memory:
+**Set leverage on Bitget.** A 1.5×ATR stop on BTC 5m is roughly 0.5%, so 1% risk means ~2× equity of notional. The bot **never sets leverage** — it uses whatever is configured per symbol. Too low and every order is rejected for margin. 10× or more is fine; it doesn't change your risk, which the stop fixes at 1%.
 
-- `GET /api/v2/mix/account/account` → `posMode` ∈ `one_way_mode` | `hedge_mode`
-- `GET /api/v2/spot/account/info` → `authorities`, e.g. `["trade","readonly"]`
-- `stopLoss`/`takeProfit` params → `presetStopLossPrice` / `presetStopSurplusPrice` on the entry order
-- post-only → `force: 'post_only'`; passphrase → ccxt's `password`
-- Fees 0.020% / 0.060% at VIP 0
+**Minimum order size.** At small equity, 1% risk can compute below Bitget's minimum. The bot **skips** rather than rounding up past the risk ceiling. Logged as `entry.below_min_size`.
+
+**Nothing here has run against the real exchange.** Everything is tested against fakes. The main untested assumption is that Bitget returns `presetStopLossPrice` where `_has_protection` looks for it — if not, every filled entry reads as unprotected and gets flattened immediately. Run `MODE=demo` first and confirm the logged state matches the Bitget UI.
 
 ---
 
 ## Known limits
 
-- **Bitget serves ~30 days of 5m candles from the recent endpoint**, which is exactly the warm-up window. The live bot is fine (it needs precisely that much); the backtester pages the history-candles endpoint via `since` for anything deeper.
-- **Funding history is not fetched by the backtester.** The regime filter's funding condition is evaluated live but assumed in backtests.
-- **A position whose open time the exchange does not report cannot be aged**, so its time stop will not fire. It still carries its exchange-side stop and target. Logged as `position.age_unknown`.
+- **Bitget serves ~30 days of 5m candles** from the recent endpoint. Fine for the scalper (60-bar warm-up); the forced-flow strategy consumes exactly that window before it can trade at all.
+- **Funding history is not fetched by the backtester.** `--funding 0` assumes it was always benign, which is optimistic. Only affects forced flow, whose regime filter reads it.
+- **A position whose open time the exchange does not report cannot be aged**, so its time stop will not fire. Exchange-side stop and target still apply. Logged as `position.age_unknown`.
+- **The loop blocks for `entry_limit_timeout_seconds` during a scalper entry.** Reconciliation is delayed by that long, once per entry.

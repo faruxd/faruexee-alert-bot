@@ -17,15 +17,25 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Sequence
 
+from backtest.data import resample
 from backtest.fills import (
+    EntryFill,
     fee_for,
     find_entry_fill,
     gross_pnl,
+    market_entry_fill_price,
     stop_fill_price,
     stop_hit,
     target_hit,
 )
 from cf_bot import guards
+from cf_bot.scalper import (
+    MIN_SIGNAL_BARS as SCALPER_MIN_SIGNAL_BARS,
+    TIME_STOP_BARS as SCALPER_TIME_STOP_BARS,
+    ScalperParams,
+)
+from cf_bot.scalper import evaluate as evaluate_scalper
+from cf_bot.scalper import BAR_MS_15M
 from cf_bot.strategy import (
     ENTRY_VALID_BARS,
     TIME_STOP_BARS,
@@ -70,9 +80,32 @@ class BacktestConfig:
     assumed_funding: Optional[Decimal] = Decimal("0")
     apply_guards: bool = True
 
+    # --- scalper ----------------------------------------------------------
+    # When set, the EMA scalper is driven instead of forced flow.
+    scalper_params: Optional[ScalperParams] = None
+
+    @property
+    def is_scalper(self) -> bool:
+        return self.scalper_params is not None
+
+    @property
+    def time_stop_bars(self) -> int:
+        return SCALPER_TIME_STOP_BARS if self.is_scalper else TIME_STOP_BARS
+
 
 def _reason_none(bars_needed: int, available: int) -> str:
     return f"insufficient history: need {bars_needed}, have {available}"
+
+
+def _trend_bars_up_to(trend_bars: list[Bar], timestamp_ms: int) -> list[Bar]:
+    """
+    Trend bars that had CLOSED by the time this signal bar closed.
+
+    A 15m bar stamped 08:00 covers 08:00-08:15 and is only complete at 08:15.
+    Including it while evaluating the 08:05 signal bar would be lookahead --
+    reading a candle that has not finished forming.
+    """
+    return [b for b in trend_bars if b.timestamp_ms + BAR_MS_15M <= timestamp_ms]
 
 
 def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trade], list[str]]:
@@ -89,6 +122,10 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
     if len(bars) < 100:
         warnings.append(_reason_none(100, len(bars)))
         return trades, warnings
+
+    # The scalper's 15m trend series is derived from the same 5m data rather
+    # than fetched separately, so the two series cannot disagree.
+    trend_bars: list[Bar] = resample(bars, 3) if config.is_scalper else []
 
     equity = config.starting_equity
     open_until_index = -1  # index through which a position is held
@@ -121,25 +158,50 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
             else False
         )
 
-        signal = evaluate(
-            symbol=config.symbol,
-            bars=bars[: i + 1],
-            funding_rate=config.assumed_funding,
-            params=config.params,
-            in_settlement_blackout=in_blackout,
-        )
+        if config.is_scalper:
+            if i < SCALPER_MIN_SIGNAL_BARS:
+                continue
+            signal = evaluate_scalper(
+                symbol=config.symbol,
+                signal_bars=bars[: i + 1],
+                trend_bars=_trend_bars_up_to(trend_bars, signal_bar.timestamp_ms),
+                params=config.scalper_params,
+                in_settlement_blackout=in_blackout,
+            )
+        else:
+            signal = evaluate(
+                symbol=config.symbol,
+                bars=bars[: i + 1],
+                funding_rate=config.assumed_funding,
+                params=config.params,
+                in_settlement_blackout=in_blackout,
+            )
+
         if signal is None:
             continue
 
-        fill = find_entry_fill(
-            bars=bars,
-            signal_index=i,
-            side=signal.side,
-            limit_price=signal.entry_price,
-            valid_bars=ENTRY_VALID_BARS,
-        )
-        if fill is None:
-            continue  # order expired unfilled -- this is the common case
+        if config.is_scalper:
+            # Worst-case fill assumption: always a market order at the next
+            # bar's open, always paying taker. Live, the passive leg fills some
+            # of the time at maker, so real fees land BELOW this. Modelling the
+            # optimistic case would be the easy way to manufacture an edge.
+            if i + 1 >= len(bars):
+                continue
+            fill = EntryFill(
+                bar_index=i + 1,
+                timestamp_ms=bars[i + 1].timestamp_ms,
+                price=market_entry_fill_price(bars[i + 1], signal.side),
+            )
+        else:
+            fill = find_entry_fill(
+                bars=bars,
+                signal_index=i,
+                side=signal.side,
+                limit_price=signal.entry_price,
+                valid_bars=ENTRY_VALID_BARS,
+            )
+            if fill is None:
+                continue  # order expired unfilled -- this is the common case
 
         qty = position_size(
             equity=equity,
@@ -190,7 +252,7 @@ def _simulate_exit(
     """
     side = signal.side
     risk_per_unit = abs(signal.entry_price - signal.stop_price)
-    last_index = min(fill_index + TIME_STOP_BARS, len(bars) - 1)
+    last_index = min(fill_index + config.time_stop_bars, len(bars) - 1)
 
     exit_price: Optional[Decimal] = None
     exit_ts = bars[last_index].timestamp_ms
@@ -231,7 +293,7 @@ def _simulate_exit(
     gross = gross_pnl(side, entry_price, exit_price, qty)
 
     # Entry was a post-only limit -> maker. Exit fee depends on how it left.
-    entry_fee = fee_for(entry_price * qty, is_maker=True)
+    entry_fee = fee_for(entry_price * qty, is_maker=not config.is_scalper)
     exit_fee = fee_for(exit_price * qty, is_maker=exit_is_maker)
     fees = entry_fee + exit_fee
 

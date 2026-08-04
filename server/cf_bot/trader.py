@@ -40,11 +40,21 @@ from cf_bot.orders import (
     UnprotectedPositionError,
     cancel_expired_entries,
     flatten,
+    place_entry_limit_then_market,
     place_entry_with_protection,
 )
+from cf_bot.scalper import (
+    MIN_SIGNAL_BARS as SCALPER_MIN_SIGNAL_BARS,
+    MIN_TREND_BARS as SCALPER_MIN_TREND_BARS,
+    SIGNAL_TIMEFRAME,
+    TREND_TIMEFRAME,
+    ScalperParams,
+)
+from cf_bot.scalper import evaluate as evaluate_scalper
 from cf_bot.state import AccountState, Position
 from cf_bot.strategy import (
     BAR_MS_5M,
+    ENTRY_VALID_BARS,
     PERCENTILE_LOOKBACK_BARS,
     TIME_STOP_BARS,
     Bar,
@@ -64,21 +74,27 @@ REFRESH_BARS = 50
 
 class BarCache:
     """
-    Per-symbol OHLCV cache.
+    OHLCV cache, keyed by (symbol, timeframe).
 
-    Holds only closed bars, oldest first, capped at REQUIRED_BARS. Purely a
-    performance cache -- it is never the authority on anything, and losing it
-    (a restart) costs one full refetch, not correctness.
+    Holds only closed bars, oldest first. Purely a performance cache -- never
+    the authority on anything. Losing it (a restart) costs one refetch, not
+    correctness.
+
+    Keyed by timeframe because the scalper needs two series per symbol: 5m for
+    the cross and 15m for the trend filter.
     """
 
     def __init__(self) -> None:
-        self._bars: dict[str, list[Bar]] = {}
+        self._bars: dict[tuple[str, str], list[Bar]] = {}
 
-    def has_full_history(self, symbol: str) -> bool:
-        return len(self._bars.get(symbol, [])) >= REQUIRED_BARS
+    def _key(self, symbol: str, timeframe: str) -> tuple[str, str]:
+        return (symbol, timeframe)
 
-    def latest_closed_ts(self, symbol: str) -> Optional[int]:
-        bars = self._bars.get(symbol)
+    def has_full_history(self, symbol: str, timeframe: str, required: int) -> bool:
+        return len(self._bars.get(self._key(symbol, timeframe), [])) >= required
+
+    def latest_closed_ts(self, symbol: str, timeframe: str) -> Optional[int]:
+        bars = self._bars.get(self._key(symbol, timeframe))
         return bars[-1].timestamp_ms if bars else None
 
     async def refresh(
@@ -86,31 +102,33 @@ class BarCache:
         client: BitgetClient,
         symbol: str,
         timeframe: str,
+        required: int,
         limiter: RateLimiter,
     ) -> list[Bar]:
-        """Fetch or top up, then return the closed-bar series for this symbol."""
+        """Fetch or top up, then return the closed-bar series."""
         await limiter.acquire()
+        key = self._key(symbol, timeframe)
 
-        if self.has_full_history(symbol):
+        if self.has_full_history(symbol, timeframe, required):
             rows = await client.fetch_ohlcv(symbol, timeframe, limit=REFRESH_BARS)
         else:
-            rows = await client.fetch_ohlcv(symbol, timeframe, limit=REQUIRED_BARS)
+            rows = await client.fetch_ohlcv(symbol, timeframe, limit=required)
 
         if not rows:
-            return self._bars.get(symbol, [])
+            return self._bars.get(key, [])
 
-        # The final row is the FORMING candle. The strategy is defined on closed
-        # bars only; acting on a forming bar means acting on a close that has
-        # not happened.
+        # The final row is the FORMING candle. Both strategies are defined on
+        # closed bars only; acting on a forming bar means acting on a close that
+        # has not happened.
         incoming = [Bar.from_ccxt(row) for row in rows[:-1]]
 
-        merged: dict[int, Bar] = {b.timestamp_ms: b for b in self._bars.get(symbol, [])}
+        merged: dict[int, Bar] = {b.timestamp_ms: b for b in self._bars.get(key, [])}
         for candle in incoming:
             merged[candle.timestamp_ms] = candle
 
         ordered = [merged[ts] for ts in sorted(merged)]
-        self._bars[symbol] = ordered[-REQUIRED_BARS:]
-        return self._bars[symbol]
+        self._bars[key] = ordered[-required:]
+        return self._bars[key]
 
 
 class Trader:
@@ -191,7 +209,7 @@ async def handle_open_positions(
     return acted
 
 
-async def scan_for_signal(
+async def _scan_forced_flow(
     client: BitgetClient,
     config: AppConfig,
     state: AccountState,
@@ -199,11 +217,6 @@ async def scan_for_signal(
     log,
     limiter: RateLimiter,
 ) -> Optional[Signal]:
-    """
-    Evaluate every configured symbol in priority order; return the first signal.
-
-    Only ONE position is held across all symbols, so the first match wins.
-    """
     params = StrategyParams(
         k=config.settings.strategy.k,
         s=config.settings.strategy.s,
@@ -214,7 +227,9 @@ async def scan_for_signal(
 
     for symbol in client.symbols:
         try:
-            bars = await trader.bars.refresh(client, symbol, timeframe, limiter)
+            bars = await trader.bars.refresh(
+                client, symbol, timeframe, REQUIRED_BARS, limiter
+            )
         except ExchangeError as exc:
             log.warning("scan.ohlcv_failed", symbol=symbol, error=str(exc))
             continue
@@ -225,7 +240,6 @@ async def scan_for_signal(
         latest_ts = bars[-1].timestamp_ms
         if trader.last_evaluated_bar.get(symbol) == latest_ts:
             continue  # no new closed bar since we last looked
-
         trader.last_evaluated_bar[symbol] = latest_ts
 
         try:
@@ -243,10 +257,93 @@ async def scan_for_signal(
             in_settlement_blackout=in_blackout,
         )
         if signal is not None:
-            log.info("signal.found", symbol=symbol, signal=signal.describe())
+            log.info("signal.found", strategy="forced_flow", symbol=symbol,
+                     signal=signal.describe())
             return signal
 
     return None
+
+
+async def _scan_ema_scalper(
+    client: BitgetClient,
+    config: AppConfig,
+    state: AccountState,
+    trader: Trader,
+    log,
+    limiter: RateLimiter,
+) -> Optional[Signal]:
+    """
+    15m EMA sets direction; a 5m EMA cross in that direction triggers.
+
+    Needs two series per symbol, so it costs twice the requests of the
+    forced-flow scan -- but far fewer bars each, since there is no 30-day
+    percentile window to fill.
+    """
+    settings = config.settings.strategy
+    params = ScalperParams(
+        ema_fast=settings.ema_fast,
+        ema_slow=settings.ema_slow,
+        ema_trend=settings.ema_trend,
+        atr_mult=settings.atr_mult,
+        target_r=settings.target_r,
+    )
+    in_blackout = guards.in_settlement_blackout(state.fetched_at_ms)
+
+    signal_needed = max(params.warmup_bars, SCALPER_MIN_SIGNAL_BARS) + 5
+    trend_needed = max(params.ema_trend * 3, SCALPER_MIN_TREND_BARS) + 5
+
+    for symbol in client.symbols:
+        try:
+            signal_bars = await trader.bars.refresh(
+                client, symbol, SIGNAL_TIMEFRAME, signal_needed, limiter
+            )
+            trend_bars = await trader.bars.refresh(
+                client, symbol, TREND_TIMEFRAME, trend_needed, limiter
+            )
+        except ExchangeError as exc:
+            log.warning("scan.ohlcv_failed", symbol=symbol, error=str(exc))
+            continue
+
+        if len(signal_bars) < 2 or len(trend_bars) < 2:
+            continue
+
+        latest_ts = signal_bars[-1].timestamp_ms
+        if trader.last_evaluated_bar.get(symbol) == latest_ts:
+            continue  # a cross only counts once
+        trader.last_evaluated_bar[symbol] = latest_ts
+
+        signal = evaluate_scalper(
+            symbol=symbol,
+            signal_bars=signal_bars,
+            trend_bars=trend_bars,
+            params=params,
+            in_settlement_blackout=in_blackout,
+        )
+        if signal is not None:
+            log.info("signal.found", strategy="ema_scalper", symbol=symbol,
+                     signal=signal.describe())
+            return signal
+
+    return None
+
+
+async def scan_for_signal(
+    client: BitgetClient,
+    config: AppConfig,
+    state: AccountState,
+    trader: Trader,
+    log,
+    limiter: RateLimiter,
+) -> Optional[Signal]:
+    """
+    Evaluate every configured symbol in priority order; return the first signal.
+
+    Only ONE position is held across all symbols, so the first match wins and
+    the remaining symbols are not evaluated.
+    """
+    if config.settings.strategy.is_scalper:
+        return await _scan_ema_scalper(client, config, state, trader, log, limiter)
+    return await _scan_forced_flow(client, config, state, trader, log, limiter)
 
 
 async def try_enter(
@@ -295,18 +392,39 @@ async def try_enter(
         log.warning("entry.zero_size", symbol=signal.symbol)
         return False
 
-    result = await place_entry_with_protection(
-        client=client,
-        symbol=signal.symbol,
-        side=signal.side,
-        amount=amount,
-        price=signal.entry_price,
-        stop_price=signal.stop_price,
-        take_profit_price=signal.target_price,
-        signal_bar_ts=signal.signal_bar_ts,
-        log=log,
-        limiter=limiter,
-    )
+    if config.settings.strategy.is_scalper:
+        # Scalper: rest passively, then take the fill at market if the move ran
+        # away. Missing the entry is the failure mode this strategy cares about.
+        result = await place_entry_limit_then_market(
+            client=client,
+            symbol=signal.symbol,
+            side=signal.side,
+            amount=amount,
+            price=signal.entry_price,
+            stop_price=signal.stop_price,
+            take_profit_price=signal.target_price,
+            signal_bar_ts=signal.signal_bar_ts,
+            timeout_seconds=config.settings.runtime.entry_limit_timeout_seconds,
+            log=log,
+            limiter=limiter,
+        )
+    else:
+        # Forced flow: post-only only. Never chase -- the whole thesis is that
+        # price reverts TO our level, so a fill we had to pay up for is not the
+        # trade the strategy identified.
+        result = await place_entry_with_protection(
+            client=client,
+            symbol=signal.symbol,
+            side=signal.side,
+            amount=amount,
+            price=signal.entry_price,
+            stop_price=signal.stop_price,
+            take_profit_price=signal.target_price,
+            signal_bar_ts=signal.signal_bar_ts,
+            log=log,
+            limiter=limiter,
+        )
+
     return result.any_fill
 
 
@@ -329,7 +447,12 @@ async def run_iteration(
     for symbol in client.symbols:
         try:
             await cancel_expired_entries(
-                client, symbol, state.fetched_at_ms, state.fetched_at_ms, log, limiter
+                client,
+                symbol,
+                state.fetched_at_ms,
+                ENTRY_VALID_BARS * BAR_MS_5M,
+                log,
+                limiter,
             )
         except DemoModeRefusal:
             pass

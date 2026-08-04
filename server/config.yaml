@@ -36,7 +36,30 @@ risk:
   risk_pct: 1.0
 
 strategy:
-  # The ONLY three tunable parameters in the system. Do not add a fourth.
+  # Which strategy runs: "ema_scalper" or "forced_flow".
+  name: "ema_scalper"
+
+  # --- ema_scalper -----------------------------------------------------------
+  # 15m EMA(ema_trend) sets direction; a 5m EMA(fast)/EMA(slow) cross in that
+  # direction triggers the entry.
+  ema_fast: 9
+  ema_slow: 21
+  ema_trend: 50
+
+  # Stop distance in ATR(14) units on the 5m.
+  #
+  # DO NOT tighten this without doing the fee arithmetic. Position size is
+  # equity*risk / stop_distance, and fees are charged on notional, so halving
+  # the stop doubles the notional AND doubles the fee cost per unit of risk.
+  # At 1.5x ATR (~0.5% on BTC 5m) a taker round trip costs roughly 0.25R.
+  # At 0.5x ATR it costs roughly 0.75R, which no realistic edge survives.
+  atr_mult: 1.5
+
+  # Target as a multiple of risk. A 2R target keeps the fee drag a smaller
+  # fraction of each winner.
+  target_r: 2.0
+
+  # --- forced_flow (unused while name is ema_scalper) ------------------------
   k: 2.5     # displacement threshold, in ATR units
   s: 1.25    # stop distance, in ATR units
   p: 30      # ATR percentile floor
@@ -45,6 +68,12 @@ runtime:
   loop_interval_seconds: 15.0
   heartbeat_seconds: 300.0
   kill_file: "KILL"
+
+  # Scalper only: how long the entry rests passively before falling back to a
+  # market order. Longer means more maker fills (0.020%) and fewer taker fills
+  # (0.060%), at the cost of missing more moves. The loop is blocked for this
+  # long during an entry.
+  entry_limit_timeout_seconds: 25.0
 
 logging:
   level: "INFO"

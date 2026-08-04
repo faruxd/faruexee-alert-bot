@@ -20,7 +20,9 @@ from cf_bot.orders import (
     ExecutionError,
     RateLimiter,
     UnprotectedPositionError,
+    cancel_expired_entries,
     flatten,
+    place_entry_limit_then_market,
     place_entry_with_protection,
 )
 from tests.conftest import FakeBitgetClient
@@ -250,6 +252,232 @@ async def test_flatten_raises_when_the_position_will_not_close(log, limiter):
     with pytest.raises(ExecutionError) as exc:
         await flatten(client, "BTC/USDT:USDT", log, limiter, reason="test")
     assert "MANUAL INTERVENTION REQUIRED" in str(exc.value)
+
+
+# --- limit-then-market entry (scalper) --------------------------------------
+
+
+async def scalper_entry(client, log, limiter, timeout=0.0, amount="0.01"):
+    return await place_entry_limit_then_market(
+        client=client,
+        symbol="BTC/USDT:USDT",
+        side="long",
+        amount=Decimal(amount),
+        price=Decimal("64000"),
+        stop_price=Decimal("63000"),
+        take_profit_price=Decimal("66000"),
+        signal_bar_ts=1717000000000,
+        timeout_seconds=timeout,
+        log=log,
+        limiter=limiter,
+    )
+
+
+async def test_a_limit_that_fills_never_pays_taker(log, limiter):
+    """
+    The whole point of the two-leg entry: when the market comes to us we stop
+    there and pay maker.
+    """
+    client = FakeBitgetClient(positions=[position_payload()])
+    result = await scalper_entry(client, log, limiter)
+
+    assert result.any_fill is True
+    assert result.protected is True
+    kinds = [o["kind"] for o in client.sent_orders]
+    assert kinds == ["entry"], f"expected only a limit leg, got {kinds}"
+
+
+async def test_an_unfilled_limit_is_cancelled_then_marketed(log, limiter):
+    client = FakeBitgetClient(positions=[])  # nothing fills passively
+
+    async def fill_on_market(**kwargs):
+        client.sent_orders.append({"kind": "market_entry", **kwargs})
+        client.positions = [position_payload()]
+        return {"id": "market-1"}
+
+    client.create_market_entry_with_protection = fill_on_market
+    result = await scalper_entry(client, log, limiter)
+
+    kinds = [o["kind"] for o in client.sent_orders]
+    assert kinds == ["entry", "market_entry"]
+    assert "BTC/USDT:USDT" in client.cancel_all_calls, "stale limit was not cancelled"
+    assert result.any_fill is True
+
+
+async def test_the_two_legs_use_different_client_order_ids(log, limiter):
+    """
+    They must differ, or the venue rejects the fallback as a duplicate of the
+    order we just cancelled -- and the entry would silently never happen.
+    """
+    client = FakeBitgetClient(positions=[])
+
+    async def fill_on_market(**kwargs):
+        client.sent_orders.append({"kind": "market_entry", **kwargs})
+        client.positions = [position_payload()]
+        return {"id": "market-1"}
+
+    client.create_market_entry_with_protection = fill_on_market
+    await scalper_entry(client, log, limiter)
+
+    limit_oid = client.sent_orders[0]["client_order_id"]
+    market_oid = client.sent_orders[1]["client_order_id"]
+    assert limit_oid != market_oid
+
+
+async def test_both_legs_are_still_deterministic(log, limiter):
+    """Different from each other, but each stable across runs."""
+    ids = []
+    for _ in range(2):
+        client = FakeBitgetClient(positions=[])
+
+        async def fill_on_market(**kwargs):
+            client.sent_orders.append({"kind": "market_entry", **kwargs})
+            client.positions = [position_payload()]
+            return {"id": "m"}
+
+        client.create_market_entry_with_protection = fill_on_market
+        await scalper_entry(client, log, limiter)
+        ids.append([o["client_order_id"] for o in client.sent_orders])
+
+    assert ids[0] == ids[1]
+
+
+async def test_a_post_only_rejection_goes_straight_to_market(log, limiter):
+    """
+    Post-only rejects when price has already moved through our level. That is
+    the venue saying a passive fill is impossible, not an error.
+    """
+    client = FakeBitgetClient(positions=[])
+
+    async def reject_post_only(**kwargs):
+        raise OrderRejected("post only would take liquidity")
+
+    async def fill_on_market(**kwargs):
+        client.sent_orders.append({"kind": "market_entry", **kwargs})
+        client.positions = [position_payload()]
+        return {"id": "market-1"}
+
+    client.create_entry_with_protection = reject_post_only
+    client.create_market_entry_with_protection = fill_on_market
+
+    result = await scalper_entry(client, log, limiter)
+    assert [o["kind"] for o in client.sent_orders] == ["market_entry"]
+    assert result.any_fill is True
+
+
+async def test_the_market_leg_still_carries_stop_and_target(log, limiter):
+    """No entry path in this codebase may leave a position bare."""
+    client = FakeBitgetClient(positions=[])
+
+    async def fill_on_market(**kwargs):
+        client.sent_orders.append({"kind": "market_entry", **kwargs})
+        client.positions = [position_payload()]
+        return {"id": "market-1"}
+
+    client.create_market_entry_with_protection = fill_on_market
+    await scalper_entry(client, log, limiter)
+
+    market_leg = client.sent_orders[-1]
+    assert market_leg["stop_price"] == Decimal("63000")
+    assert market_leg["take_profit_price"] == Decimal("66000")
+
+
+async def test_a_market_fill_without_protection_is_flattened(log, limiter):
+    client = FakeBitgetClient(positions=[])
+
+    async def fill_unprotected(**kwargs):
+        client.sent_orders.append({"kind": "market_entry", **kwargs})
+        client.positions = [position_payload(preset_stop=None)]
+        return {"id": "market-1"}
+
+    client.create_market_entry_with_protection = fill_unprotected
+    result = await scalper_entry(client, log, limiter)
+
+    assert result.protected is False
+    assert any(o["kind"] == "close" for o in client.sent_orders)
+
+
+async def test_scalper_entry_is_refused_in_demo(log, limiter):
+    client = FakeBitgetClient(mode="demo")
+    with pytest.raises(DemoModeRefusal):
+        await scalper_entry(client, log, limiter)
+    assert client.sent_orders == []
+
+
+# --- entry expiry ----------------------------------------------------------
+#
+# REGRESSION: the first version compared now_ms against a deadline the caller
+# passed as now_ms, so the condition was always false and NOTHING was ever
+# cancelled. Unfilled entries would have rested on the exchange forever. Orders
+# are now aged by their own exchange-reported timestamp.
+
+NOW = 1_717_000_000_000
+THREE_BARS_MS = 3 * 5 * 60 * 1000
+
+
+def resting_entry(order_id="e-1", age_minutes=0.0, reduce_only=False):
+    return {
+        "id": order_id,
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "type": "limit",
+        "price": 64000.0,
+        "amount": 0.01,
+        "reduceOnly": reduce_only,
+        "status": "open",
+        "timestamp": NOW - int(age_minutes * 60_000),
+    }
+
+
+async def test_an_entry_older_than_its_window_is_cancelled(log, limiter):
+    client = FakeBitgetClient(open_orders=[resting_entry(age_minutes=20)])
+    cancelled = await cancel_expired_entries(
+        client, "BTC/USDT:USDT", NOW, THREE_BARS_MS, log, limiter
+    )
+    assert cancelled == 1
+    assert client.cancelled == ["e-1"]
+
+
+async def test_a_fresh_entry_is_left_alone(log, limiter):
+    client = FakeBitgetClient(open_orders=[resting_entry(age_minutes=5)])
+    assert (
+        await cancel_expired_entries(client, "BTC/USDT:USDT", NOW, THREE_BARS_MS, log, limiter)
+        == 0
+    )
+    assert client.cancelled == []
+
+
+async def test_protection_is_never_cancelled_however_old(log, limiter):
+    """A reduce-only order is the stop. Ageing it out would strip the position bare."""
+    client = FakeBitgetClient(
+        open_orders=[resting_entry(order_id="stop-1", age_minutes=600, reduce_only=True)]
+    )
+    assert (
+        await cancel_expired_entries(client, "BTC/USDT:USDT", NOW, THREE_BARS_MS, log, limiter)
+        == 0
+    )
+    assert client.cancelled == []
+
+
+async def test_an_order_with_no_timestamp_is_left_alone(log, limiter):
+    """Cancelling on a guess could kill an order placed seconds ago."""
+    stale = resting_entry(age_minutes=99)
+    del stale["timestamp"]
+    client = FakeBitgetClient(open_orders=[stale])
+    assert (
+        await cancel_expired_entries(client, "BTC/USDT:USDT", NOW, THREE_BARS_MS, log, limiter)
+        == 0
+    )
+
+
+async def test_other_symbols_are_untouched(log, limiter):
+    other = resting_entry(order_id="eth-1", age_minutes=20)
+    other["symbol"] = "ETH/USDT:USDT"
+    client = FakeBitgetClient(open_orders=[other])
+    assert (
+        await cancel_expired_entries(client, "BTC/USDT:USDT", NOW, THREE_BARS_MS, log, limiter)
+        == 0
+    )
 
 
 # --- mode gate -------------------------------------------------------------

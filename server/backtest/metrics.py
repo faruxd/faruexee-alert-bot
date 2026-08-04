@@ -125,13 +125,18 @@ def compute(trades: Sequence[Trade], starting_equity: Decimal) -> Metrics:
     )
 
 
-def render(metrics: Metrics, warnings: Sequence[str], funding_note: str) -> str:
+def render(
+    metrics: Metrics,
+    warnings: Sequence[str],
+    funding_note: str,
+    title: str = "BACKTEST",
+) -> str:
     """Human-readable report."""
     lines: list[str] = []
     add = lines.append
 
     add("=" * 66)
-    add("  CF 'FORCED FLOW' BACKTEST")
+    add(f"  {title}")
     add("=" * 66)
 
     if metrics.trade_count == 0:

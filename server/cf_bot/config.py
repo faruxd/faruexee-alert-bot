@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from cf_bot.constants import (
     LIVE_CONFIRMATION_ENV,
@@ -230,6 +237,19 @@ class RuntimeSettings(BaseModel):
     loop_interval_seconds: float = 15.0
     heartbeat_seconds: float = 300.0
     kill_file: str = "KILL"
+    # How long a scalper entry rests passively before falling back to market.
+    # Longer = more maker fills = cheaper, but more missed moves.
+    entry_limit_timeout_seconds: float = 25.0
+
+    @field_validator("entry_limit_timeout_seconds")
+    @classmethod
+    def _sane_entry_timeout(cls, v: float) -> float:
+        if not (0.0 <= v <= 120.0):
+            raise ValueError(
+                f"entry_limit_timeout_seconds={v} is outside the sane range [0, 120]. "
+                "The loop is blocked for this long during an entry."
+            )
+        return v
 
     @field_validator("loop_interval_seconds")
     @classmethod
@@ -258,25 +278,52 @@ class LoggingSettings(BaseModel):
         return v
 
 
+STRATEGY_FORCED_FLOW = "forced_flow"
+STRATEGY_EMA_SCALPER = "ema_scalper"
+VALID_STRATEGIES = (STRATEGY_FORCED_FLOW, STRATEGY_EMA_SCALPER)
+
+
 class StrategySettings(BaseModel):
     """
-    The only three tunable parameters in the system.
+    Which strategy runs, and its parameters.
 
-    There is no fourth. Adding one here is a spec violation, not a feature.
+    Both strategies' parameters live here with defaults, so a config only needs
+    to specify the ones for the strategy it selects. `extra="forbid"` still
+    catches typos in either set.
     """
 
     model_config = _STRICT
 
-    k: Decimal = Decimal("2.5")  # displacement threshold, ATR units
-    s: Decimal = Decimal("1.25")  # stop distance, ATR units
-    p: Decimal = Decimal("30")  # ATR percentile floor
+    name: str = STRATEGY_FORCED_FLOW
 
-    @field_validator("k", "s", "p", mode="before")
+    # --- forced_flow: displacement threshold, stop distance, percentile floor
+    k: Decimal = Decimal("2.5")
+    s: Decimal = Decimal("1.25")
+    p: Decimal = Decimal("30")
+
+    # --- ema_scalper: 15m trend filter, 5m cross trigger, ATR stop, R target
+    ema_fast: int = 9
+    ema_slow: int = 21
+    ema_trend: int = 50
+    atr_mult: Decimal = Decimal("1.5")
+    target_r: Decimal = Decimal("2.0")
+
+    @field_validator("name")
+    @classmethod
+    def _known_strategy(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in VALID_STRATEGIES:
+            raise ValueError(
+                f"strategy.name={v!r} is not valid. Must be one of {list(VALID_STRATEGIES)}."
+            )
+        return v
+
+    @field_validator("k", "s", "p", "atr_mult", "target_r", mode="before")
     @classmethod
     def _to_decimal(cls, v: object) -> Decimal:
         return _coerce_decimal(v)
 
-    @field_validator("k", "s")
+    @field_validator("k", "s", "atr_mult", "target_r")
     @classmethod
     def _positive(cls, v: Decimal) -> Decimal:
         if v <= 0:
@@ -289,6 +336,26 @@ class StrategySettings(BaseModel):
         if not (0 <= v <= 100):
             raise ValueError(f"p must be a percentile in [0, 100], got {v}")
         return v
+
+    @field_validator("ema_fast", "ema_slow", "ema_trend")
+    @classmethod
+    def _sane_ema_period(cls, v: int) -> int:
+        if not (2 <= v <= 400):
+            raise ValueError(f"EMA period {v} is outside the sane range [2, 400]")
+        return v
+
+    @model_validator(mode="after")
+    def _fast_is_faster_than_slow(self) -> "StrategySettings":
+        if self.ema_slow <= self.ema_fast:
+            raise ValueError(
+                f"ema_slow ({self.ema_slow}) must be greater than ema_fast "
+                f"({self.ema_fast}), or the cross has no meaning"
+            )
+        return self
+
+    @property
+    def is_scalper(self) -> bool:
+        return self.name == STRATEGY_EMA_SCALPER
 
 
 class Settings(BaseModel):
@@ -365,9 +432,22 @@ class AppConfig:
             "margin_coin": self.settings.exchange.margin_coin,
             "risk_pct": f"{self.settings.risk.risk_pct}%",
             "max_risk_pct_ceiling": f"{MAX_RISK_PCT}%",
-            "strategy_k": str(self.settings.strategy.k),
-            "strategy_s": str(self.settings.strategy.s),
-            "strategy_p": str(self.settings.strategy.p),
+            "strategy": self.settings.strategy.name,
+            **(
+                {
+                    "ema_fast": self.settings.strategy.ema_fast,
+                    "ema_slow": self.settings.strategy.ema_slow,
+                    "ema_trend": self.settings.strategy.ema_trend,
+                    "atr_mult": str(self.settings.strategy.atr_mult),
+                    "target_r": str(self.settings.strategy.target_r),
+                }
+                if self.settings.strategy.is_scalper
+                else {
+                    "strategy_k": str(self.settings.strategy.k),
+                    "strategy_s": str(self.settings.strategy.s),
+                    "strategy_p": str(self.settings.strategy.p),
+                }
+            ),
             "loop_interval_seconds": self.settings.runtime.loop_interval_seconds,
             "kill_file": str(self.kill_file),
             "log_file": str(self.log_file),

@@ -31,6 +31,7 @@ from cf_bot.exchange import (
 )
 from cf_bot.ids import (
     PURPOSE_ENTRY,
+    PURPOSE_ENTRY_MARKET,
     PURPOSE_FLATTEN,
     client_order_id,
 )
@@ -367,17 +368,216 @@ async def place_entry_with_protection(
     )
 
 
+async def place_entry_limit_then_market(
+    client: BitgetClient,
+    symbol: str,
+    side: str,
+    amount: Decimal,
+    price: Decimal,
+    stop_price: Decimal,
+    take_profit_price: Decimal,
+    signal_bar_ts: int,
+    timeout_seconds: float,
+    log,
+    limiter: RateLimiter,
+) -> EntryResult:
+    """
+    Rest a post-only limit; if it has not filled within `timeout_seconds`,
+    cancel it and take the fill at market.
+
+    The point is fee control. A market entry pays 0.060% taker; a passive fill
+    pays 0.020% maker. On a scalper at 1% risk those are 0.40R and 0.13R of
+    round-trip drag respectively, so paying taker only when the market refuses
+    to come to us is worth the added complexity.
+
+    Both legs carry the stop and target as presets, so neither can leave a
+    position unprotected. The legs use DIFFERENT deterministic ids, because the
+    venue would reject the fallback as a duplicate otherwise.
+    """
+    limit_oid = client_order_id(symbol, signal_bar_ts, side, PURPOSE_ENTRY)
+
+    log.info(
+        "entry.submitting_limit",
+        symbol=symbol,
+        side=side,
+        amount=str(amount),
+        price=str(price),
+        stop=str(stop_price),
+        target=str(take_profit_price),
+        timeout_seconds=timeout_seconds,
+        client_order_id=limit_oid,
+    )
+
+    limit_placed = True
+    try:
+        await _with_retry(
+            lambda: client.create_entry_with_protection(
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                price=price,
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
+                client_order_id=limit_oid,
+            ),
+            f"limit entry {side} {symbol}",
+            log,
+            limiter,
+        )
+    except OrderRejected as exc:
+        # Post-only rejects when the price has already moved through our level.
+        # That is not a failure -- it is the venue telling us a passive fill is
+        # no longer possible, so go straight to the fallback.
+        log.info("entry.post_only_rejected", symbol=symbol, error=str(exc))
+        limit_placed = False
+
+    if limit_placed:
+        await asyncio.sleep(timeout_seconds)
+
+        await limiter.acquire()
+        position = await _live_position(client, symbol)
+        if position is not None and position.contracts > 0:
+            return await _verify_or_flatten(
+                client, symbol, side, position.contracts, amount, limit_oid, log, limiter
+            )
+
+        log.info("entry.limit_unfilled", symbol=symbol, action="cancelling for market fallback")
+        await _with_retry(
+            lambda: client.cancel_all_orders(symbol),
+            f"cancel unfilled limit {symbol}",
+            log,
+            limiter,
+        )
+
+    market_oid = client_order_id(symbol, signal_bar_ts, side, PURPOSE_ENTRY_MARKET)
+    log.warning(
+        "entry.market_fallback",
+        symbol=symbol,
+        side=side,
+        amount=str(amount),
+        client_order_id=market_oid,
+        note="paying taker fee because the passive limit did not fill",
+    )
+
+    await _with_retry(
+        lambda: client.create_market_entry_with_protection(
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            client_order_id=market_oid,
+        ),
+        f"market entry {side} {symbol}",
+        log,
+        limiter,
+    )
+
+    await limiter.acquire()
+    position = await _live_position(client, symbol)
+    filled = position.contracts if position is not None else Decimal(0)
+
+    if filled <= 0:
+        log.error("entry.market_did_not_fill", symbol=symbol, client_order_id=market_oid)
+        return EntryResult(
+            symbol=symbol,
+            side=side,
+            requested_amount=amount,
+            filled_amount=Decimal(0),
+            order_id=None,
+            client_order_id=market_oid,
+            protected=True,
+        )
+
+    return await _verify_or_flatten(
+        client, symbol, side, filled, amount, market_oid, log, limiter
+    )
+
+
+async def _verify_or_flatten(
+    client: BitgetClient,
+    symbol: str,
+    side: str,
+    filled: Decimal,
+    requested: Decimal,
+    oid: str,
+    log,
+    limiter: RateLimiter,
+) -> EntryResult:
+    """
+    Confirm a filled position is protected, or close it at market.
+
+    Shared by both entry paths. This is the enforcement point for the rule that
+    a position never exists on the exchange without a stop.
+    """
+    await limiter.acquire()
+    protected = await _has_protection(client, symbol)
+
+    if not protected:
+        log.error(
+            "entry.unprotected",
+            symbol=symbol,
+            filled=str(filled),
+            action="flattening immediately at market",
+        )
+        try:
+            await flatten(client, symbol, log, limiter, reason="entry filled without protection")
+        except ExecutionError as exc:
+            raise UnprotectedPositionError(
+                f"{symbol} filled {filled} with no stop on the exchange and could not be "
+                f"flattened: {exc}. MANUAL INTERVENTION REQUIRED."
+            ) from exc
+
+        return EntryResult(
+            symbol=symbol,
+            side=side,
+            requested_amount=requested,
+            filled_amount=Decimal(0),
+            order_id=None,
+            client_order_id=oid,
+            protected=False,
+        )
+
+    log.info(
+        "entry.filled_and_protected",
+        symbol=symbol,
+        side=side,
+        filled=str(filled),
+        requested=str(requested),
+        partial=bool(filled < requested),
+        client_order_id=oid,
+    )
+    return EntryResult(
+        symbol=symbol,
+        side=side,
+        requested_amount=requested,
+        filled_amount=filled,
+        order_id=None,
+        client_order_id=oid,
+        protected=True,
+    )
+
+
 async def cancel_expired_entries(
-    client: BitgetClient, symbol: str, now_ms: int, expiry_ms: int, log, limiter: RateLimiter
+    client: BitgetClient,
+    symbol: str,
+    now_ms: int,
+    max_age_ms: int,
+    log,
+    limiter: RateLimiter,
 ) -> int:
     """
-    Cancel any unfilled entry remainder past its 3-bar validity window.
+    Cancel unfilled entry orders older than `max_age_ms`.
+
+    Each order is aged by its OWN exchange-reported timestamp rather than
+    against a deadline we remember, so this keeps working across a restart --
+    the process has no memory of when it placed anything.
+
+    An order whose timestamp the venue did not report is left alone: cancelling
+    on a guess could kill an order placed seconds ago.
 
     Returns how many orders were cancelled.
     """
-    if now_ms <= expiry_ms:
-        return 0
-
     await limiter.acquire()
     raw_orders = await client.fetch_open_orders()
     cancelled = 0
@@ -387,9 +587,20 @@ async def cancel_expired_entries(
             continue
         if raw.get("reduceOnly"):
             continue  # never cancel protection
+
         order_id = raw.get("id")
         if not order_id:
             continue
+
+        placed_at = raw.get("timestamp")
+        if not placed_at:
+            log.warning("entry.age_unknown", symbol=symbol, order_id=order_id)
+            continue
+
+        age_ms = now_ms - int(placed_at)
+        if age_ms <= max_age_ms:
+            continue
+
         await _with_retry(
             lambda oid=order_id: client.cancel_order(oid, symbol),
             f"cancel expired entry {order_id}",
@@ -397,6 +608,11 @@ async def cancel_expired_entries(
             limiter,
         )
         cancelled += 1
-        log.info("entry.expired_cancelled", symbol=symbol, order_id=order_id)
+        log.info(
+            "entry.expired_cancelled",
+            symbol=symbol,
+            order_id=order_id,
+            age_seconds=age_ms // 1000,
+        )
 
     return cancelled

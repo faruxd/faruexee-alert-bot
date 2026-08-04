@@ -88,6 +88,22 @@ def find_entry_fill(
     return None
 
 
+def market_entry_fill_price(next_bar: Bar, side: str) -> Decimal:
+    """
+    A market entry fills at the NEXT bar's open, plus 3 bps against us.
+
+    Not at the signal bar's close. The signal is only known once that bar has
+    closed, so the earliest possible fill is the following bar -- and a market
+    order crosses the spread, so it does not fill at the touch.
+    """
+    slip = next_bar.open * STOP_SLIPPAGE_BPS / BPS
+    if side == "long":
+        return next_bar.open + slip
+    if side == "short":
+        return next_bar.open - slip
+    raise ValueError(f"unknown side {side!r}")
+
+
 def stop_fill_price(side: str, stop_price: Decimal) -> Decimal:
     """Trigger price plus 3 bps against us."""
     slip = stop_price * STOP_SLIPPAGE_BPS / BPS

@@ -134,6 +134,11 @@ class FakeBitgetClient:
         self.sent_orders.append({"kind": "entry", **kwargs})
         return {"id": "order-1", "filled": 0}
 
+    async def create_market_entry_with_protection(self, **kwargs):
+        self._require_trading(f"place a market entry on {kwargs.get('symbol')}")
+        self.sent_orders.append({"kind": "market_entry", **kwargs})
+        return {"id": "market-1", "filled": kwargs.get("amount")}
+
     async def create_reduce_only_market(self, symbol, side, amount, client_order_id):
         self._require_trading(f"close {symbol} at market")
         self.sent_orders.append(
