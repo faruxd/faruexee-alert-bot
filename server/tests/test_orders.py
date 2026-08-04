@@ -164,32 +164,39 @@ async def test_a_partial_fill_is_sized_on_what_actually_filled(log, limiter):
     assert result.protected is True
 
 
-async def test_a_fill_without_protection_is_flattened_immediately(log, limiter):
+async def test_unverifiable_protection_keeps_the_position(log, limiter):
     """
-    The constraint this whole module exists for: if the entry fills and no stop
-    is on the exchange, close the position at market. Do not retry the stop, do
-    not wait a loop, do not watch the price.
+    CHANGED after two live losses. Failing to READ a stop is not the same as
+    there being no stop -- both times it was our own query that was wrong.
+
+    Flattening on a failed read is a guaranteed loss every time it misfires:
+    open and close at market, taker both ways, about -0.5R a cycle, repeating.
+    The entry was accepted carrying preset stop and target, so the submission
+    did not fail and the spec's "flatten if the stop submission fails" does not
+    apply. Shout, emit diagnostics, keep the position.
     """
     client = FakeBitgetClient(positions=[position_payload(preset_stop=None)])
     result = await entry(client, log, limiter)
 
     assert result.protected is False
-    assert result.filled_amount == Decimal("0")
-    assert any(o["kind"] == "close" for o in client.sent_orders), "position was not flattened"
+    assert result.filled_amount == Decimal("0.01"), "size must reflect what filled"
+    assert not any(o["kind"] == "close" for o in client.sent_orders),         "flattened on a failed READ -- this is the bug that cost two positions"
 
 
-async def test_an_unflattenable_unprotected_position_escalates(log, limiter):
-    """The worst state reachable. It must raise, not be logged and continued past."""
+async def test_late_registering_protection_is_picked_up_on_the_recheck(log, limiter):
+    """A preset may not appear as a plan order the instant the fill lands."""
     client = FakeBitgetClient(positions=[position_payload(preset_stop=None)])
+    looks = {"n": 0}
 
-    async def refuse(*args, **kwargs):
-        raise ExchangeError("venue rejected the close")
+    async def appears_late(symbol):
+        looks["n"] += 1
+        return [trigger_order()] if looks["n"] > 1 else []
 
-    client.create_reduce_only_market = refuse
+    client.fetch_trigger_orders = appears_late
+    result = await entry(client, log, limiter)
 
-    with pytest.raises(UnprotectedPositionError) as exc:
-        await entry(client, log, limiter)
-    assert "MANUAL INTERVENTION REQUIRED" in str(exc.value)
+    assert result.protected is True
+    assert not any(o["kind"] == "close" for o in client.sent_orders)
 
 
 async def test_a_resting_order_needs_no_protection_yet(log, limiter):
@@ -382,7 +389,7 @@ async def test_the_market_leg_still_carries_stop_and_target(log, limiter):
     assert market_leg["take_profit_price"] == Decimal("66000")
 
 
-async def test_a_market_fill_without_protection_is_flattened(log, limiter):
+async def test_a_market_fill_with_unverifiable_protection_is_kept(log, limiter):
     client = FakeBitgetClient(positions=[])
 
     async def fill_unprotected(**kwargs):
@@ -394,7 +401,7 @@ async def test_a_market_fill_without_protection_is_flattened(log, limiter):
     result = await scalper_entry(client, log, limiter)
 
     assert result.protected is False
-    assert any(o["kind"] == "close" for o in client.sent_orders)
+    assert not any(o["kind"] == "close" for o in client.sent_orders)
 
 
 async def test_scalper_entry_is_refused_in_demo(log, limiter):
@@ -573,15 +580,15 @@ async def test_a_preset_stop_visible_only_as_a_trigger_order_counts_as_protected
         "flattened a position that WAS protected"
 
 
-async def test_genuinely_unprotected_is_still_detected(log, limiter):
-    """The fix must not blind the check -- a bare position still gets flattened."""
+async def test_a_bare_position_is_reported_but_not_destroyed(log, limiter):
+    """Reported as unprotected so the operator acts -- but not auto-closed."""
     client = FakeBitgetClient(positions=[position_payload(preset_stop=None)])
     client.open_orders = []
     client.trigger_orders = []
 
     result = await entry(client, log, limiter)
     assert result.protected is False
-    assert any(o["kind"] == "close" for o in client.sent_orders)
+    assert not any(o["kind"] == "close" for o in client.sent_orders)
 
 
 # --- cancel_all_orders on an empty book ------------------------------------

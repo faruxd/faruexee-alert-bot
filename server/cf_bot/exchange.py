@@ -566,15 +566,30 @@ class BitgetClient:
         """
         self._require_connected()
         collected: list[dict[str, Any]] = []
-        for plan_type in ("profit_loss", "normal_plan"):
+
+        # The parameter is planType. ccxt reads it as:
+        #     planType = self.safe_string(params, 'planType', 'normal_plan')
+        # An earlier version passed `isPlan`, which ccxt ignores completely --
+        # so both queries silently asked for 'normal_plan' and NEVER asked for
+        # 'profit_loss', which is where a position's TP/SL actually lives. That
+        # cost two live positions before it was spotted.
+        #
+        # 'profit_loss'  -- TP/SL attached to a position (what presets become)
+        # 'normal_plan'  -- standalone trigger orders
+        # 'track_plan'   -- trailing stops
+        for plan_type in ("profit_loss", "normal_plan", "track_plan"):
             try:
-                collected.extend(
-                    await self._exchange.fetch_open_orders(
-                        symbol, params={"trigger": True, "isPlan": plan_type}
-                    )
+                orders = await self._exchange.fetch_open_orders(
+                    symbol, params={"trigger": True, "planType": plan_type}
                 )
             except Exception as exc:
+                # One plan type failing must not hide protection recorded under
+                # another, so this is logged by the caller, not fatal here.
                 raise ExchangeError(
-                    f"fetch_trigger_orders({plan_type}) failed for {symbol}: {exc}"
+                    f"fetch_trigger_orders(planType={plan_type}) failed for {symbol}: {exc}"
                 ) from exc
+            for order in orders:
+                order.setdefault("_planType", plan_type)
+            collected.extend(orders)
+
         return collected

@@ -6,11 +6,20 @@ Policy lives here; transport lives in exchange.py.
 THE RULE THIS MODULE EXISTS TO ENFORCE
 --------------------------------------
 A position must never exist on the exchange without a reduce-only stop attached
-or resting. The entry carries its stop as a preset, so the venue attaches it at
-fill time -- but "should have" is not "did". After any fill we re-read the
-exchange and verify protection is really there. If it is not, we flatten
-immediately at market. We do not retry the stop, we do not wait a loop, we do
-not monitor the price ourselves.
+or resting. Every entry carries its stop as a PRESET on the order itself, so the
+venue attaches it at fill time and there is no window where the position exists
+bare. That submission succeeding is the guarantee.
+
+After a fill we also read the protection back -- but a failed READ is treated as
+a warning, not as proof of a bare position. That distinction was learned
+expensively: two separate bugs in our own query reported healthy positions as
+unprotected, and the response then closed them at market, taker both ways, about
+-0.5R per misfire. Flattening on a failed read is a certain loss whenever the
+reader is wrong; keeping a position whose preset the venue accepted is a risk
+only if the venue silently ignored it, which it has not been observed to do.
+
+So: shout, dump what the venue actually returned, and keep the position. The
+time stop and settlement flatten still bound the exposure.
 
 There is no in-memory stop-loss anywhere in this file. The exchange holds it.
 """
@@ -42,6 +51,10 @@ from cf_bot.state import Position
 # at exactly the moment the market is moving.
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 0.5
+
+# A preset stop does not always appear as a plan order the instant the fill
+# lands. Wait this long and look again before declaring anything unverified.
+PROTECTION_RECHECK_SECONDS = 3.0
 
 # Rate limiting. Bitget publishes 10 requests/second/UID on most private mix
 # endpoints; we run at a fraction of that. ccxt's own limiter sits underneath
@@ -180,6 +193,46 @@ def _has_stop_field(info: dict) -> bool:
         if value not in (None, "", "0", 0, "0.0"):
             return True
     return False
+
+
+async def _protection_diagnostics(client: BitgetClient, symbol: str) -> dict:
+    """
+    Exactly what the venue returned when we failed to find a stop.
+
+    Exists because two protection bugs in one day were both diagnosed by
+    guessing at Bitget's response shape and both guesses were wrong. The next
+    occurrence should hand over evidence instead.
+    """
+    payload: dict = {}
+    try:
+        triggers = await client.fetch_trigger_orders(symbol)
+        payload["trigger_order_count"] = len(triggers)
+        payload["trigger_orders"] = [
+            {
+                "planType": t.get("_planType"),
+                "id": t.get("id"),
+                "reduceOnly": t.get("reduceOnly"),
+                "triggerPrice": t.get("triggerPrice"),
+                "info_keys": sorted((t.get("info") or {}).keys()),
+            }
+            for t in triggers[:5]
+        ]
+    except Exception as exc:
+        payload["trigger_orders_error"] = str(exc)[:200]
+
+    try:
+        for raw in await client.fetch_positions():
+            if raw.get("symbol") == symbol:
+                info = raw.get("info") or {}
+                payload["position_info_keys"] = sorted(info.keys())
+                payload["position_stop_fields"] = {
+                    k: v for k, v in info.items() if "stop" in k.lower() or "tp" in k.lower()
+                    or "sl" in k.lower() or "preset" in k.lower()
+                }
+    except Exception as exc:
+        payload["position_error"] = str(exc)[:200]
+
+    return payload
 
 
 async def _has_protection(client: BitgetClient, symbol: str) -> bool:
@@ -368,53 +421,12 @@ async def place_entry_with_protection(
             protected=True,  # nothing to protect yet
         )
 
-    # Something filled. It MUST be protected.
-    await limiter.acquire()
-    protected = await _has_protection(client, symbol)
-
-    if not protected:
-        log.error(
-            "entry.unprotected",
-            symbol=symbol,
-            filled=str(filled),
-            action="flattening immediately at market",
-        )
-        try:
-            await flatten(client, symbol, log, limiter, reason="entry filled without protection")
-        except ExecutionError as exc:
-            raise UnprotectedPositionError(
-                f"{symbol} filled {filled} with no stop on the exchange and could not be "
-                f"flattened: {exc}. MANUAL INTERVENTION REQUIRED."
-            ) from exc
-
-        return EntryResult(
-            symbol=symbol,
-            side=side,
-            requested_amount=amount,
-            filled_amount=Decimal(0),
-            order_id=order_id,
-            client_order_id=oid,
-            protected=False,
-        )
-
-    log.info(
-        "entry.filled_and_protected",
-        symbol=symbol,
-        side=side,
-        filled=str(filled),
-        requested=str(amount),
-        partial=bool(filled < amount),
-        client_order_id=oid,
-    )
-
-    return EntryResult(
-        symbol=symbol,
-        side=side,
-        requested_amount=amount,
-        filled_amount=filled,
-        order_id=order_id,
-        client_order_id=oid,
-        protected=True,
+    # Something filled. It MUST be protected. ONE shared code path with the
+    # limit-then-market entry, so the two can never drift again -- they already
+    # did once, and the stale copy kept flattening live positions after the
+    # shared version was fixed.
+    return await _verify_or_flatten(
+        client, symbol, side, filled, amount, oid, log, limiter, stop_price
     )
 
 
@@ -488,7 +500,8 @@ async def place_entry_limit_then_market(
         position = await _live_position(client, symbol)
         if position is not None and position.contracts > 0:
             return await _verify_or_flatten(
-                client, symbol, side, position.contracts, amount, limit_oid, log, limiter
+                client, symbol, side, position.contracts, amount, limit_oid, log,
+                limiter, stop_price
             )
 
         log.info("entry.limit_unfilled", symbol=symbol, action="cancelling for market fallback")
@@ -540,7 +553,7 @@ async def place_entry_limit_then_market(
         )
 
     return await _verify_or_flatten(
-        client, symbol, side, filled, amount, market_oid, log, limiter
+        client, symbol, side, filled, amount, market_oid, log, limiter, stop_price
     )
 
 
@@ -553,6 +566,7 @@ async def _verify_or_flatten(
     oid: str,
     log,
     limiter: RateLimiter,
+    stop_price: Optional[Decimal] = None,
 ) -> EntryResult:
     """
     Confirm a filled position is protected, or close it at market.
@@ -564,25 +578,49 @@ async def _verify_or_flatten(
     protected = await _has_protection(client, symbol)
 
     if not protected:
+        # A preset does not necessarily register as a plan order the instant the
+        # fill lands. Look once more before concluding anything.
+        await asyncio.sleep(PROTECTION_RECHECK_SECONDS)
+        await limiter.acquire()
+        protected = await _has_protection(client, symbol)
+        if protected:
+            log.info("entry.protection_confirmed_late", symbol=symbol)
+
+    if not protected:
+        # WE COULD NOT SEE A STOP. That is NOT the same as there being no stop,
+        # and the difference cost two live positions.
+        #
+        # The rule is "if the stop SUBMISSION fails, flatten". The submission did
+        # not fail here: the venue accepted an entry carrying presetStopLossPrice
+        # and presetStopSurplusPrice without error. What failed is our ability to
+        # read the resulting protection back, and twice that was our own query
+        # being wrong rather than the exchange being bare.
+        #
+        # Flattening on a failed READ is a guaranteed loss every single time it
+        # misfires -- open and close at market, taker both ways, roughly -0.5R a
+        # cycle, repeating. Keeping a position whose stop we merely cannot see is
+        # a risk only if the venue silently ignored the presets, which it has
+        # been observed not to do.
+        #
+        # So: shout, dump exactly what the venue returned so the next occurrence
+        # produces evidence instead of another blind loss, and DO NOT flatten.
+        diagnostics = await _protection_diagnostics(client, symbol)
         log.error(
-            "entry.unprotected",
+            "entry.protection_unverified",
             symbol=symbol,
             filled=str(filled),
-            action="flattening immediately at market",
+            action="KEEPING the position; entry was accepted with preset stop and target",
+            note=(
+                "Could not read protection back from the venue. Check this symbol in "
+                "the Bitget UI now and confirm SL/TP are present."
+            ),
+            **diagnostics,
         )
-        try:
-            await flatten(client, symbol, log, limiter, reason="entry filled without protection")
-        except ExecutionError as exc:
-            raise UnprotectedPositionError(
-                f"{symbol} filled {filled} with no stop on the exchange and could not be "
-                f"flattened: {exc}. MANUAL INTERVENTION REQUIRED."
-            ) from exc
-
         return EntryResult(
             symbol=symbol,
             side=side,
             requested_amount=requested,
-            filled_amount=Decimal(0),
+            filled_amount=filled,
             order_id=None,
             client_order_id=oid,
             protected=False,
