@@ -12,15 +12,35 @@ exchange:
   # Symbols scanned each loop, in priority order. The bot holds at most ONE
   # position across ALL of them (see guards.MAX_CONCURRENT_POSITIONS), so this
   # list widens the search for a signal -- it does not multiply risk.
+  # Selected by 24h quote volume on Bitget, crypto only.
+  #
+  # DELIBERATELY EXCLUDED: Bitget's highest-volume perps after BTC/ETH are
+  # tokenized equities and commodities -- SNDK, MU, NVDA, SKHYNIX, SAMSUNG,
+  # INTC, MRVL, CRCL, XAU, XAG, CL -- plus leveraged ETFs like SOXL/SOXS/KORU.
+  # They only move during traditional market hours and they GAP overnight and
+  # over weekends. A 0.2% stop cannot survive a 3% gap, and an EMA cross on an
+  # instrument that is closed two thirds of the day is noise. Crypto only.
   symbols:
     - "BTC/USDT:USDT"
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
-    - "BNB/USDT:USDT"
     - "XRP/USDT:USDT"
+    - "ADA/USDT:USDT"
+    - "PEPE/USDT:USDT"
     - "DOGE/USDT:USDT"
-    - "LINK/USDT:USDT"
+    - "UNI/USDT:USDT"
+    - "ENA/USDT:USDT"
+    - "SUI/USDT:USDT"
     - "AVAX/USDT:USDT"
+    - "BNB/USDT:USDT"
+    - "DOT/USDT:USDT"
+    - "NEAR/USDT:USDT"
+    - "ONDO/USDT:USDT"
+    - "LINK/USDT:USDT"
+    - "AAVE/USDT:USDT"
+    - "XLM/USDT:USDT"
+    - "LTC/USDT:USDT"
+    - "ALGO/USDT:USDT"
 
   # Fixed at 5m. The strategy's bar counts (ATR 14, 30d percentile, 3-bar entry
   # validity, 12-bar time stop) are all defined against 5m bars.
@@ -65,7 +85,18 @@ strategy:
   p: 30      # ATR percentile floor
 
 runtime:
-  loop_interval_seconds: 15.0
+  # 20s at 20 symbols. reconcile costs ~2 requests per symbol (open orders and
+  # today's fills are per-symbol calls on Bitget) plus a handful of account
+  # calls, so a full loop is ~45 requests. At 20s that is ~2.3/sec, comfortably
+  # under the 4/sec limiter in orders.py.
+  #
+  # Candle fetches are NOT in that budget: the bar cache only refetches once a
+  # new bar has actually closed, so they cost ~2 requests per loop on average
+  # rather than 40.
+  #
+  # If you add more symbols, raise this proportionally or the limiter throttles
+  # and the loop silently falls behind its own interval.
+  loop_interval_seconds: 20.0
   heartbeat_seconds: 300.0
   kill_file: "KILL"
 

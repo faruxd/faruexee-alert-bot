@@ -328,3 +328,95 @@ async def test_a_clean_signal_produces_exactly_one_entry(
     assert len(entries) == 1
     assert entries[0]["stop_price"] is not None
     assert entries[0]["take_profit_price"] is not None
+
+
+# --- refresh gating (request budget) ---------------------------------------
+
+
+async def test_cache_skips_refetch_within_the_same_bar(flat_rows, limiter):
+    """
+    The loop runs every 15s but a 5m bar closes every 5 minutes. Without this
+    gate, 20 symbols x 2 timeframes would burn 40 pointless requests per
+    iteration and exhaust the rate limiter.
+    """
+    client = FakeBitgetClient(ohlcv=flat_rows)
+    calls = []
+    real = client.fetch_ohlcv
+
+    async def counted(symbol, timeframe, limit, since=None):
+        calls.append(limit)
+        return await real(symbol, timeframe, limit, since)
+
+    client.fetch_ohlcv = counted
+    cache = BarCache()
+    base = 1_700_000_000_000
+
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter, base)
+    # 15s and 30s later -- still inside the same 5m bar
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter, base + 15_000)
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter, base + 30_000)
+
+    assert len(calls) == 1, "refetched inside the same bar"
+
+
+async def test_cache_refetches_once_a_new_bar_closes(flat_rows, limiter):
+    client = FakeBitgetClient(ohlcv=flat_rows)
+    calls = []
+    real = client.fetch_ohlcv
+
+    async def counted(symbol, timeframe, limit, since=None):
+        calls.append(limit)
+        return await real(symbol, timeframe, limit, since)
+
+    client.fetch_ohlcv = counted
+    cache = BarCache()
+    base = 1_700_000_000_000
+
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter, base)
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter, base + 6 * 60_000)
+
+    assert len(calls) == 2
+
+
+async def test_the_two_timeframes_are_gated_independently(flat_rows, limiter):
+    """A 5m bar closing must not trigger a 15m refetch."""
+    client = FakeBitgetClient(ohlcv=flat_rows)
+    calls = []
+    real = client.fetch_ohlcv
+
+    async def counted(symbol, timeframe, limit, since=None):
+        calls.append(timeframe)
+        return await real(symbol, timeframe, limit, since)
+
+    client.fetch_ohlcv = counted
+    cache = BarCache()
+    # Align to a 15m boundary. An arbitrary timestamp may sit moments before one,
+    # in which case +6min legitimately crosses it and the test proves nothing.
+    base = (1_700_000_000_000 // 900_000) * 900_000
+
+    for tf in ("5m", "15m"):
+        await cache.refresh(client, "BTC/USDT:USDT", tf, 200, limiter, base)
+    calls.clear()
+
+    # 6 minutes past the boundary: a new 5m bar has closed, but not a 15m one.
+    for tf in ("5m", "15m"):
+        await cache.refresh(client, "BTC/USDT:USDT", tf, 200, limiter, base + 6 * 60_000)
+
+    assert calls == ["5m"]
+
+
+async def test_omitting_now_ms_always_refetches(flat_rows, limiter):
+    """Back-compat: callers that do not pass a clock keep the old behaviour."""
+    client = FakeBitgetClient(ohlcv=flat_rows)
+    calls = []
+    real = client.fetch_ohlcv
+
+    async def counted(symbol, timeframe, limit, since=None):
+        calls.append(limit)
+        return await real(symbol, timeframe, limit, since)
+
+    client.fetch_ohlcv = counted
+    cache = BarCache()
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
+    await cache.refresh(client, "BTC/USDT:USDT", "5m", REQUIRED_BARS, limiter)
+    assert len(calls) == 2

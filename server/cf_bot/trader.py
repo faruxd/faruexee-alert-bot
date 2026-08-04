@@ -32,7 +32,12 @@ from typing import Optional
 
 from cf_bot import guards
 from cf_bot.config import AppConfig
-from cf_bot.exchange import BitgetClient, DemoModeRefusal, ExchangeError
+from cf_bot.exchange import (
+    BitgetClient,
+    DemoModeRefusal,
+    ExchangeError,
+    timeframe_to_ms,
+)
 from cf_bot.guards import GuardContext
 from cf_bot.orders import (
     ExecutionError,
@@ -86,6 +91,7 @@ class BarCache:
 
     def __init__(self) -> None:
         self._bars: dict[tuple[str, str], list[Bar]] = {}
+        self._last_refresh_ms: dict[tuple[str, str], int] = {}
 
     def _key(self, symbol: str, timeframe: str) -> tuple[str, str]:
         return (symbol, timeframe)
@@ -97,6 +103,27 @@ class BarCache:
         bars = self._bars.get(self._key(symbol, timeframe))
         return bars[-1].timestamp_ms if bars else None
 
+    def needs_refresh(self, symbol: str, timeframe: str, now_ms: int) -> bool:
+        """
+        Has a new bar closed since we last fetched this series?
+
+        The loop runs every 15s but a 5m bar closes every 5 minutes, so without
+        this gate the bot refetches the same candles ~20 times per bar. At 20
+        symbols x 2 timeframes that is 40 pointless requests every iteration --
+        enough to exhaust the rate limiter and make the loop fall behind.
+
+        Comparing bar-slot indices rather than elapsed time means the refresh
+        lands right after a real bar boundary, not on an arbitrary timer.
+        """
+        key = self._key(symbol, timeframe)
+        if key not in self._bars:
+            return True
+        last = self._last_refresh_ms.get(key)
+        if last is None:
+            return True
+        bar_ms = timeframe_to_ms(timeframe)
+        return (now_ms // bar_ms) > (last // bar_ms)
+
     async def refresh(
         self,
         client: BitgetClient,
@@ -104,10 +131,22 @@ class BarCache:
         timeframe: str,
         required: int,
         limiter: RateLimiter,
+        now_ms: Optional[int] = None,
     ) -> list[Bar]:
-        """Fetch or top up, then return the closed-bar series."""
-        await limiter.acquire()
+        """
+        Fetch or top up, then return the closed-bar series.
+
+        When `now_ms` is given and no new bar has closed since the last fetch,
+        the cached series is returned without touching the network.
+        """
         key = self._key(symbol, timeframe)
+
+        if now_ms is not None and not self.needs_refresh(symbol, timeframe, now_ms):
+            return self._bars.get(key, [])
+
+        await limiter.acquire()
+        if now_ms is not None:
+            self._last_refresh_ms[key] = now_ms
 
         if self.has_full_history(symbol, timeframe, required):
             rows = await client.fetch_ohlcv(symbol, timeframe, limit=REFRESH_BARS)
@@ -228,7 +267,7 @@ async def _scan_forced_flow(
     for symbol in client.symbols:
         try:
             bars = await trader.bars.refresh(
-                client, symbol, timeframe, REQUIRED_BARS, limiter
+                client, symbol, timeframe, REQUIRED_BARS, limiter, state.fetched_at_ms
             )
         except ExchangeError as exc:
             log.warning("scan.ohlcv_failed", symbol=symbol, error=str(exc))
@@ -295,10 +334,10 @@ async def _scan_ema_scalper(
     for symbol in client.symbols:
         try:
             signal_bars = await trader.bars.refresh(
-                client, symbol, SIGNAL_TIMEFRAME, signal_needed, limiter
+                client, symbol, SIGNAL_TIMEFRAME, signal_needed, limiter, state.fetched_at_ms
             )
             trend_bars = await trader.bars.refresh(
-                client, symbol, TREND_TIMEFRAME, trend_needed, limiter
+                client, symbol, TREND_TIMEFRAME, trend_needed, limiter, state.fetched_at_ms
             )
         except ExchangeError as exc:
             log.warning("scan.ohlcv_failed", symbol=symbol, error=str(exc))
