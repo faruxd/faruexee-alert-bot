@@ -64,6 +64,32 @@ _FINAL_REJECTION_TYPES = (
 )
 
 
+# Bitget's hard cap on candles per request. Verified empirically against the
+# live endpoint: asking for 500 or 1000 both return 200. Do NOT raise this
+# because a doc page says otherwise -- the venue is the authority.
+MAX_BARS_PER_REQUEST = 200
+
+_TIMEFRAME_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+
+def timeframe_to_ms(timeframe: str) -> int:
+    try:
+        return _TIMEFRAME_MS[timeframe]
+    except KeyError:
+        raise ExchangeError(
+            f"unknown timeframe {timeframe!r}; known: {sorted(_TIMEFRAME_MS)}"
+        ) from None
+
+
 def utc_day_start_ms(now: Optional[datetime] = None) -> int:
     """Milliseconds since epoch at 00:00:00 UTC of the current day."""
     now = datetime.now(timezone.utc) if now is None else now.astimezone(timezone.utc)
@@ -306,34 +332,49 @@ class BitgetClient:
         """
         Closed candles, oldest first.
 
-        Bitget caps a single 5m request well below the 8640 bars the strategy's
-        30-day percentile window needs, so this pages backwards until it has
-        enough or the venue stops returning new data.
+        Bitget returns AT MOST MAX_BARS_PER_REQUEST rows however many you ask
+        for -- verified empirically: requesting 500 or 1000 both return 200. So
+        anything larger has to be paged, and the loop must never treat a short
+        batch as "no more data", because every full batch is short relative to
+        what we asked for.
+
+        When no `since` is given we derive one from the bar count requested, so
+        a caller can simply ask for N bars ending now.
         """
         self._require_connected()
-        per_request = 1000
-        collected: list[list] = []
-        cursor = since
 
+        if limit <= 0:
+            return []
+
+        bar_ms = timeframe_to_ms(timeframe)
+        cursor = since
+        if cursor is None:
+            # Ask for a window a little wider than needed; the venue trims to
+            # whatever history it actually has.
+            span = int(limit * bar_ms * 1.2)
+            cursor = int(datetime.now(timezone.utc).timestamp() * 1000) - span
+
+        collected: dict[int, list] = {}
         try:
-            if cursor is not None:
-                while len(collected) < limit:
-                    batch = await self._exchange.fetch_ohlcv(
-                        symbol, timeframe, since=cursor, limit=per_request
-                    )
-                    if not batch:
-                        break
-                    collected.extend(batch)
-                    next_cursor = batch[-1][0] + 1
-                    if next_cursor == cursor:
-                        break
-                    cursor = next_cursor
-            else:
-                collected = await self._exchange.fetch_ohlcv(
-                    symbol, timeframe, limit=min(limit, per_request)
+            while len(collected) < limit:
+                batch = await self._exchange.fetch_ohlcv(
+                    symbol, timeframe, since=cursor, limit=MAX_BARS_PER_REQUEST
                 )
+                if not batch:
+                    break
+
+                for row in batch:
+                    collected[int(row[0])] = row
+
+                next_cursor = int(batch[-1][0]) + 1
+                if next_cursor <= cursor:
+                    break  # no forward progress; stop rather than spin
+                cursor = next_cursor
         except Exception as exc:
             raise ExchangeError(f"fetch_ohlcv failed for {symbol}: {exc}") from exc
+
+        collected_rows = [collected[ts] for ts in sorted(collected)]
+        return collected_rows[-limit:]
 
         # De-duplicate by timestamp and keep chronological order.
         seen: dict[int, list] = {}

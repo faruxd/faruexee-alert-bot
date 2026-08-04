@@ -13,6 +13,7 @@ in front of the warm-up window.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 from decimal import Decimal
 from pathlib import Path
@@ -20,9 +21,43 @@ from typing import Optional
 
 import ccxt.async_support as ccxt
 
+from cf_bot.exchange import MAX_BARS_PER_REQUEST
 from cf_bot.strategy import Bar
 
 BAR_MS_5M = 5 * 60 * 1000
+
+
+async def _fetch_batch_with_backoff(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    cursor: int,
+    limit: int,
+    max_attempts: int = 6,
+) -> list[list]:
+    """
+    One page, retrying on rate limiting.
+
+    A long backfill issues hundreds of requests back to back and WILL trip
+    Bitget's 429. That is not an error worth aborting a 20-minute download for,
+    so we wait and continue. This is the backtester only -- the live bot runs
+    nowhere near these rates.
+    """
+    delay = 2.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=limit)
+        except (ccxt.DDoSProtection, ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
+            if attempt == max_attempts:
+                raise
+            print(
+                f"  rate limited ({type(exc).__name__}), waiting {delay:.0f}s "
+                f"[{attempt}/{max_attempts}]",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    return []
 
 
 async def fetch_history(
@@ -30,9 +65,18 @@ async def fetch_history(
     timeframe: str,
     since_ms: int,
     until_ms: Optional[int] = None,
-    per_request: int = 1000,
+    per_request: int = MAX_BARS_PER_REQUEST,
+    progress: bool = True,
 ) -> list[Bar]:
-    """Page forward from since_ms. Public data; no credentials involved."""
+    """
+    Page forward from since_ms. Public data; no credentials involved.
+
+    Bitget returns at most 200 rows however many you request, so a batch being
+    "smaller than asked for" says nothing about whether more history exists.
+    An earlier version broke out of the loop on that condition and silently
+    fetched only the first 200 bars. Termination is now on an empty batch, a
+    cursor that fails to advance, or reaching until_ms.
+    """
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     collected: dict[int, list] = {}
 
@@ -40,14 +84,17 @@ async def fetch_history(
         await exchange.load_markets()
         cursor = since_ms
         while True:
-            batch = await exchange.fetch_ohlcv(
-                symbol, timeframe, since=cursor, limit=per_request
+            batch = await _fetch_batch_with_backoff(
+                exchange, symbol, timeframe, cursor, per_request
             )
             if not batch:
                 break
 
             for row in batch:
                 collected[int(row[0])] = row
+
+            if progress and len(collected) % 5000 < per_request:
+                print(f"  ... {len(collected)} bars", flush=True)
 
             last_ts = int(batch[-1][0])
             if until_ms is not None and last_ts >= until_ms:
@@ -56,9 +103,6 @@ async def fetch_history(
             if next_cursor <= cursor:
                 break
             cursor = next_cursor
-
-            if len(batch) < per_request:
-                break
     finally:
         await exchange.close()
 

@@ -130,9 +130,16 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
     equity = config.starting_equity
     open_until_index = -1  # index through which a position is held
     entries_by_day: dict[str, int] = {}
-    consecutive_losses = 0
     daily_realised: dict[str, Decimal] = {}
     day_open_equity: dict[str, Decimal] = {}
+    # Losing streak WITHIN the current UTC day.
+    #
+    # This must reset daily, because the live guard derives it from
+    # todays_closed_positions and therefore cannot see yesterday. A single
+    # running counter deadlocks the backtest: once it reaches the limit, no
+    # further trade can occur, so no win can ever reset it, so the strategy
+    # stops trading permanently on the first three-loss day.
+    losses_by_day: dict[str, int] = {}
 
     for i in range(1, len(bars)):
         if i <= open_until_index:
@@ -145,7 +152,7 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
         if config.apply_guards:
             if entries_by_day.get(day_key, 0) >= guards.MAX_ENTRIES_PER_UTC_DAY:
                 continue
-            if consecutive_losses >= guards.MAX_CONSECUTIVE_LOSSES:
+            if losses_by_day.get(day_key, 0) >= guards.MAX_CONSECUTIVE_LOSSES:
                 continue
             realised = daily_realised.get(day_key, Decimal(0))
             opening = day_open_equity[day_key]
@@ -225,7 +232,7 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
         equity += trade.net
         entries_by_day[day_key] = entries_by_day.get(day_key, 0) + 1
         daily_realised[day_key] = daily_realised.get(day_key, Decimal(0)) + trade.net
-        consecutive_losses = 0 if trade.is_win else consecutive_losses + 1
+        losses_by_day[day_key] = 0 if trade.is_win else losses_by_day.get(day_key, 0) + 1
 
         open_until_index = _index_of_ts(bars, trade.exit_ts, fallback=fill.bar_index)
 
