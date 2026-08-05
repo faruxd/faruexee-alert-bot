@@ -168,15 +168,54 @@ def _fmt_size(value: Optional[Decimal]) -> str:
     return text or "0"
 
 
-def position_opened_message(position, mode: str, equity: Optional[Decimal]) -> str:
+def _pct_away(price: Optional[Decimal], entry: Optional[Decimal]) -> str:
+    if price is None or entry is None or entry == 0:
+        return ""
+    pct = abs(price - entry) / entry * Decimal(100)
+    return f" ({_fmt(pct, '0.01')}%)"
+
+
+def position_opened_message(
+    position,
+    mode: str,
+    equity: Optional[Decimal],
+    stop_price: Optional[Decimal] = None,
+    target_price: Optional[Decimal] = None,
+) -> str:
     arrow = "🟢 LONG" if position.side == "long" else "🔴 SHORT"
-    return (
-        f"**{arrow} opened** — `{position.symbol}`\n"
-        f"Size: `{_fmt_size(position.contracts)}`  |  "
-        f"Entry: `{_fmt(position.entry_price)}`\n"
+    entry = position.entry_price
+
+    lines = [
+        f"**{arrow} opened** — `{position.symbol}`",
+        f"Size: `{_fmt_size(position.contracts)}`  |  Entry: `{_fmt(entry)}`",
+    ]
+
+    # A missing level is shown as "not found" rather than omitted. If the stop
+    # is genuinely absent that is the single most important thing on the alert,
+    # and a silently missing line would read as though everything were fine.
+    stop_text = f"`{_fmt(stop_price)}`{_pct_away(stop_price, entry)}" if stop_price else "`NOT FOUND`"
+    target_text = (
+        f"`{_fmt(target_price)}`{_pct_away(target_price, entry)}" if target_price else "`NOT FOUND`"
+    )
+    lines.append(f"🛑 SL: {stop_text}  |  🎯 TP: {target_text}")
+
+    if stop_price is not None and entry is not None:
+        risk = abs(entry - stop_price) * position.contracts
+        detail = f"Risk: `{_fmt(risk, '0.0001')}` USDT"
+        if target_price is not None:
+            reward = abs(target_price - entry) * position.contracts
+            denominator = abs(entry - stop_price)
+            if denominator > 0:
+                rr = abs(target_price - entry) / denominator
+                detail += f"  |  R:R `{_fmt(rr, '0.01')}`"
+            detail += f"  |  Target: `{_fmt(reward, '0.0001')}` USDT"
+        lines.append(detail)
+
+    lines.append(
         f"Liq: `{_fmt(position.liquidation_price)}`  |  "
         f"Equity: `{_fmt(equity)}` USDT  |  mode: `{mode}`"
     )
+    return "\n".join(lines)
 
 
 def position_closed_message(

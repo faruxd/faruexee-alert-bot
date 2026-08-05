@@ -42,7 +42,13 @@ from cf_bot.notify import (
     position_closed_message,
     position_opened_message,
 )
-from cf_bot.orders import ExecutionError, RateLimiter, UnprotectedPositionError, flatten
+from cf_bot.orders import (
+    ExecutionError,
+    RateLimiter,
+    UnprotectedPositionError,
+    fetch_protection_levels,
+    flatten,
+)
 from cf_bot.preflight import PreflightError, run_all as run_preflight
 from cf_bot.reconcile import ReconcileError, reconcile
 from cf_bot.state import AccountState
@@ -148,6 +154,7 @@ def _position_key(position) -> tuple[str, str]:
 
 async def _notify_position_changes(
     notifier: DiscordNotifier,
+    client: BitgetClient,
     previous: Optional[AccountState],
     current: AccountState,
     log,
@@ -169,9 +176,19 @@ async def _notify_position_changes(
 
     for key in after.keys() - before.keys():
         position = after[key]
-        log.info("notify.position_opened", position=position.describe())
+        stop_price, target_price = await fetch_protection_levels(
+            client, position.symbol, position.side, position.entry_price
+        )
+        log.info(
+            "notify.position_opened",
+            position=position.describe(),
+            stop=str(stop_price) if stop_price else None,
+            target=str(target_price) if target_price else None,
+        )
         await notifier.send(
-            position_opened_message(position, current.mode, current.equity)
+            position_opened_message(
+                position, current.mode, current.equity, stop_price, target_price
+            )
         )
 
     for key in before.keys() - after.keys():
@@ -286,7 +303,7 @@ async def _run_loop(config: AppConfig, credentials: Credentials, log) -> int:
                 await _sleep_or_shutdown(shutdown, config.settings.runtime.loop_interval_seconds)
                 continue
 
-            await _notify_position_changes(notifier, last_state, state, log)
+            await _notify_position_changes(notifier, client, last_state, state, log)
             last_state = state
 
             comparable = state.comparable()

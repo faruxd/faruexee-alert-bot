@@ -195,6 +195,68 @@ def _has_stop_field(info: dict) -> bool:
     return False
 
 
+async def fetch_protection_levels(
+    client: BitgetClient, symbol: str, side: str, entry_price: Optional[Decimal]
+) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    """
+    Return (stop_price, target_price) for an open position, or (None, None).
+
+    Read from the venue's TRIGGER orders, which is the source proven to actually
+    contain them -- the position payload's preset fields are not dependable, and
+    trusting them is what broke the protection check twice.
+
+    Which trigger is the stop and which is the target is decided by GEOMETRY,
+    not by field names:
+
+        long  -> stop is BELOW entry, target is ABOVE
+        short -> stop is ABOVE entry, target is BELOW
+
+    That holds by construction for every signal this bot produces, and it cannot
+    be invalidated by Bitget renaming a field.
+
+    Never raises. This feeds a notification; a failure here must not disturb
+    trading.
+    """
+    if entry_price is None or entry_price <= 0:
+        return None, None
+
+    try:
+        triggers = await client.fetch_trigger_orders(symbol)
+    except Exception:
+        return None, None
+
+    below: list[Decimal] = []
+    above: list[Decimal] = []
+    for raw in triggers:
+        price = raw.get("triggerPrice") or raw.get("stopPrice")
+        if price is None:
+            info = raw.get("info") or {}
+            price = (
+                info.get("triggerPrice")
+                or info.get("stopLossTriggerPrice")
+                or info.get("stopSurplusTriggerPrice")
+            )
+        if price in (None, "", 0, "0"):
+            continue
+        try:
+            value = Decimal(str(price))
+        except Exception:
+            continue
+        if value <= 0:
+            continue
+        (below if value < entry_price else above).append(value)
+
+    if side == "long":
+        # Nearest below is the stop; nearest above is the target.
+        stop = max(below) if below else None
+        target = min(above) if above else None
+    else:
+        stop = min(above) if above else None
+        target = max(below) if below else None
+
+    return stop, target
+
+
 async def _protection_diagnostics(client: BitgetClient, symbol: str) -> dict:
     """
     Exactly what the venue returned when we failed to find a stop.

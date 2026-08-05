@@ -21,6 +21,7 @@ from cf_bot.orders import (
     RateLimiter,
     UnprotectedPositionError,
     cancel_expired_entries,
+    fetch_protection_levels,
     flatten,
     place_entry_limit_then_market,
     place_entry_with_protection,
@@ -627,3 +628,64 @@ async def test_cancel_failure_never_blocks_the_close(log, limiter):
 
     assert await flatten(client, "BTC/USDT:USDT", log, limiter, reason="test") is True
     assert any(o["kind"] == "close" for o in client.sent_orders)
+
+
+# --- protection levels for the alert ---------------------------------------
+
+
+def _trigger(price, symbol="BTC/USDT:USDT"):
+    return {"id": f"p{price}", "symbol": symbol, "triggerPrice": float(price),
+            "reduceOnly": True, "info": {}}
+
+
+async def test_levels_for_a_long_are_classified_by_geometry(log, limiter):
+    """
+    Long: the trigger BELOW entry is the stop, the one ABOVE is the target.
+    Geometry cannot be invalidated by Bitget renaming a field.
+    """
+    client = FakeBitgetClient()
+    client.trigger_orders = [_trigger(66000), _trigger(62000)]
+
+    stop, target = await fetch_protection_levels(
+        client, "BTC/USDT:USDT", "long", Decimal("64000")
+    )
+    assert stop == Decimal("62000")
+    assert target == Decimal("66000")
+
+
+async def test_levels_for_a_short_are_mirrored(log, limiter):
+    client = FakeBitgetClient()
+    client.trigger_orders = [_trigger(66000), _trigger(62000)]
+
+    stop, target = await fetch_protection_levels(
+        client, "BTC/USDT:USDT", "short", Decimal("64000")
+    )
+    assert stop == Decimal("66000")
+    assert target == Decimal("62000")
+
+
+async def test_a_stop_with_no_target_still_resolves(log, limiter):
+    client = FakeBitgetClient()
+    client.trigger_orders = [_trigger(62000)]
+
+    stop, target = await fetch_protection_levels(
+        client, "BTC/USDT:USDT", "long", Decimal("64000")
+    )
+    assert stop == Decimal("62000")
+    assert target is None
+
+
+async def test_level_lookup_failure_never_raises(log, limiter, exchange_error):
+    """This feeds a notification. It must not disturb trading."""
+    client = FakeBitgetClient()
+    client.trigger_orders = exchange_error
+
+    assert await fetch_protection_levels(
+        client, "BTC/USDT:USDT", "long", Decimal("64000")
+    ) == (None, None)
+
+
+async def test_no_entry_price_means_no_levels(log, limiter):
+    client = FakeBitgetClient()
+    client.trigger_orders = [_trigger(62000)]
+    assert await fetch_protection_levels(client, "BTC/USDT:USDT", "long", None) == (None, None)

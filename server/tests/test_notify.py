@@ -334,3 +334,52 @@ def test_size_keeps_significant_digits_without_scientific_notation():
     message = position_opened_message(position, "live", Decimal("20.50"))
     assert "0.0009" in message
     assert "E-" not in message
+
+
+# --- SL / TP on the open alert ---------------------------------------------
+
+
+def test_opened_message_shows_stop_and_target():
+    message = position_opened_message(
+        make_position("short"), "live", Decimal("38.03"),
+        stop_price=Decimal("63831.44"), target_price=Decimal("63309.32"),
+    )
+    assert "63831.44" in message
+    assert "63309.32" in message
+    assert "SL" in message and "TP" in message
+
+
+def test_a_missing_stop_is_shown_loudly_not_omitted():
+    """
+    If the stop is genuinely absent that is the most important thing on the
+    alert. A silently missing line would read as though all were well.
+    """
+    message = position_opened_message(make_position(), "live", Decimal("38.03"))
+    assert "NOT FOUND" in message
+
+
+def test_risk_in_usdt_is_shown():
+    position = make_position("long")           # 0.001 @ 64000.5
+    message = position_opened_message(
+        position, "live", Decimal("38.03"),
+        stop_price=Decimal("63000"), target_price=Decimal("66000"),
+    )
+    # |64000.5 - 63000| * 0.001 = 1.0005
+    assert "1.0005" in message
+
+
+def test_reward_to_risk_is_shown():
+    position = make_position("long")           # entry 64000.5
+    message = position_opened_message(
+        position, "live", Decimal("38.03"),
+        stop_price=Decimal("63000.5"), target_price=Decimal("66000.5"),
+    )
+    assert "R:R" in message and "2.00" in message
+
+
+def test_distance_percentages_are_shown():
+    message = position_opened_message(
+        make_position("long"), "live", Decimal("38.03"),
+        stop_price=Decimal("62720.49"), target_price=Decimal("66560.52"),
+    )
+    assert "%" in message
