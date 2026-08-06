@@ -90,17 +90,17 @@ def test_a_forming_15m_bar_is_excluded():
     """
     trend = [bar(0, "100", "101", "99", "100"), bar(BAR_MS_15M, "100", "101", "99", "100")]
 
-    at_0005 = _trend_bars_up_to(trend, BAR_MS_5M)
+    at_0005 = _trend_bars_up_to(trend, BAR_MS_5M, BAR_MS_15M)
     assert at_0005 == [], "used a 15m bar that had not closed yet"
 
-    at_0015 = _trend_bars_up_to(trend, BAR_MS_15M)
+    at_0015 = _trend_bars_up_to(trend, BAR_MS_15M, BAR_MS_15M)
     assert len(at_0015) == 1
 
 
 def test_trend_bars_accumulate_as_time_advances():
     trend = [bar(i * BAR_MS_15M, "100", "101", "99", "100") for i in range(4)]
-    assert len(_trend_bars_up_to(trend, 2 * BAR_MS_15M)) == 2
-    assert len(_trend_bars_up_to(trend, 4 * BAR_MS_15M)) == 4
+    assert len(_trend_bars_up_to(trend, 2 * BAR_MS_15M, BAR_MS_15M)) == 2
+    assert len(_trend_bars_up_to(trend, 4 * BAR_MS_15M, BAR_MS_15M)) == 4
 
 
 # --- fills -----------------------------------------------------------------

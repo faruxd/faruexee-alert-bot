@@ -67,6 +67,12 @@ class ScalperParams:
     atr_mult: Decimal = Decimal("1.5")
     target_r: Decimal = Decimal("2.0")
 
+    # Length of one SIGNAL bar. Only used to stamp expiry and time-stop times
+    # onto the Signal -- the strategy logic itself is bar-count based and so is
+    # timeframe-agnostic. Parameterised rather than hardcoded so the backtester
+    # can drive the identical function at 15m, 1h and 4h.
+    bar_ms: int = BAR_MS_5M
+
     def __post_init__(self) -> None:
         if self.ema_fast < 2:
             raise ValueError(f"ema_fast must be >= 2, got {self.ema_fast}")
@@ -279,6 +285,6 @@ def evaluate(
         # the cross, which is the closest analogue to signal strength. It is
         # logged for diagnostics and is NOT used to scale position size.
         displacement=stop_distance,
-        entry_expires_after_ts=signal_bar.timestamp_ms + ENTRY_VALID_BARS * BAR_MS_5M,
-        time_stop_ts=signal_bar.timestamp_ms + TIME_STOP_BARS * BAR_MS_5M,
+        entry_expires_after_ts=signal_bar.timestamp_ms + ENTRY_VALID_BARS * params.bar_ms,
+        time_stop_ts=signal_bar.timestamp_ms + TIME_STOP_BARS * params.bar_ms,
     )

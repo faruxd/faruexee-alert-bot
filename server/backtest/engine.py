@@ -13,6 +13,7 @@ will never actually run.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Sequence
@@ -31,11 +32,12 @@ from backtest.fills import (
 from cf_bot import guards
 from cf_bot.scalper import (
     MIN_SIGNAL_BARS as SCALPER_MIN_SIGNAL_BARS,
+    MIN_TREND_BARS as SCALPER_MIN_TREND_BARS,
     TIME_STOP_BARS as SCALPER_TIME_STOP_BARS,
     ScalperParams,
 )
 from cf_bot.scalper import evaluate as evaluate_scalper
-from cf_bot.scalper import BAR_MS_15M
+from cf_bot.scalper import BAR_MS_5M, BAR_MS_15M
 from cf_bot.strategy import (
     ENTRY_VALID_BARS,
     TIME_STOP_BARS,
@@ -83,6 +85,10 @@ class BacktestConfig:
     # --- scalper ----------------------------------------------------------
     # When set, the EMA scalper is driven instead of forced flow.
     scalper_params: Optional[ScalperParams] = None
+    # How many 5m bars make one SIGNAL bar and one TREND bar. The input series
+    # is always 5m; both are resampled from it so the two can never disagree.
+    signal_factor: int = 1      # 1=5m, 3=15m, 12=1h, 48=4h
+    trend_factor: int = 3       # conventionally 3-4x the signal timeframe
 
     @property
     def is_scalper(self) -> bool:
@@ -97,7 +103,9 @@ def _reason_none(bars_needed: int, available: int) -> str:
     return f"insufficient history: need {bars_needed}, have {available}"
 
 
-def _trend_bars_up_to(trend_bars: list[Bar], timestamp_ms: int) -> list[Bar]:
+def _trend_bars_up_to(
+    trend_bars: list[Bar], timestamp_ms: int, trend_bar_ms: int
+) -> list[Bar]:
     """
     Trend bars that had CLOSED by the time this signal bar closed.
 
@@ -105,7 +113,7 @@ def _trend_bars_up_to(trend_bars: list[Bar], timestamp_ms: int) -> list[Bar]:
     Including it while evaluating the 08:05 signal bar would be lookahead --
     reading a candle that has not finished forming.
     """
-    return [b for b in trend_bars if b.timestamp_ms + BAR_MS_15M <= timestamp_ms]
+    return [b for b in trend_bars if b.timestamp_ms + trend_bar_ms <= timestamp_ms]
 
 
 def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trade], list[str]]:
@@ -125,7 +133,34 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
 
     # The scalper's 15m trend series is derived from the same 5m data rather
     # than fetched separately, so the two series cannot disagree.
-    trend_bars: list[Bar] = resample(bars, 3) if config.is_scalper else []
+    # Both series are resampled from the SAME 5m input, so the trend filter can
+    # never disagree with the signal series about what price did.
+    if config.is_scalper:
+        trend_bars = resample(bars, config.trend_factor)
+        if config.signal_factor > 1:
+            bars = resample(bars, config.signal_factor)
+    else:
+        trend_bars = []
+
+    # Bound the windows handed to the strategy to exactly what the LIVE bot
+    # passes it. Two reasons, and the second matters more:
+    #
+    #  1. Speed. Slicing bars[:i+1] re-ran the EMAs over the whole history on
+    #     every bar -- O(n^2), which on a year of 5m data is billions of Decimal
+    #     operations and simply never finishes.
+    #  2. Fidelity. The live BarCache is capped at these same counts, so a
+    #     backtest feeding unbounded history would be evaluating a longer EMA
+    #     seed than production ever sees. Bounded is the faithful version.
+    scalper = config.scalper_params
+    if scalper is not None:
+        signal_window = max(scalper.warmup_bars, SCALPER_MIN_SIGNAL_BARS) + 5
+        trend_window = max(scalper.ema_trend * 3, SCALPER_MIN_TREND_BARS) + 5
+    else:
+        signal_window = trend_window = 0
+
+    trend_bar_ms = config.trend_factor * BAR_MS_5M
+    # Close time of each trend bar, for an O(log n) "which had closed by now".
+    trend_close_ts = [b.timestamp_ms + trend_bar_ms for b in trend_bars]
 
     equity = config.starting_equity
     open_until_index = -1  # index through which a position is held
@@ -168,10 +203,11 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
         if config.is_scalper:
             if i < SCALPER_MIN_SIGNAL_BARS:
                 continue
+            closed_trend = bisect_right(trend_close_ts, signal_bar.timestamp_ms)
             signal = evaluate_scalper(
                 symbol=config.symbol,
-                signal_bars=bars[: i + 1],
-                trend_bars=_trend_bars_up_to(trend_bars, signal_bar.timestamp_ms),
+                signal_bars=bars[max(0, i + 1 - signal_window) : i + 1],
+                trend_bars=trend_bars[max(0, closed_trend - trend_window) : closed_trend],
                 params=config.scalper_params,
                 in_settlement_blackout=in_blackout,
             )
