@@ -20,27 +20,19 @@ exchange:
   # They only move during traditional market hours and they GAP overnight and
   # over weekends. A 0.2% stop cannot survive a 3% gap, and an EMA cross on an
   # instrument that is closed two thirds of the day is noise. Crypto only.
+  # BTC only.
+  #
+  # Twenty correlated crypto pairs all cross at the same moment when the whole
+  # market moves, so the bot fired three entries inside ten minutes -- one
+  # directional bet taken three times, all stopped out together. A single symbol
+  # removes that failure mode outright: one signal source, and the max-1-position
+  # rule then genuinely means one bet.
+  #
+  # It also means far fewer signals, so the 3-entries-per-day cap will rarely
+  # bind and entries stop being decided by whatever happened to fire first
+  # after 00:00 UTC.
   symbols:
     - "BTC/USDT:USDT"
-    - "ETH/USDT:USDT"
-    - "SOL/USDT:USDT"
-    - "XRP/USDT:USDT"
-    - "ADA/USDT:USDT"
-    - "PEPE/USDT:USDT"
-    - "DOGE/USDT:USDT"
-    - "UNI/USDT:USDT"
-    - "ENA/USDT:USDT"
-    - "SUI/USDT:USDT"
-    - "AVAX/USDT:USDT"
-    - "BNB/USDT:USDT"
-    - "DOT/USDT:USDT"
-    - "NEAR/USDT:USDT"
-    - "ONDO/USDT:USDT"
-    - "LINK/USDT:USDT"
-    - "AAVE/USDT:USDT"
-    - "XLM/USDT:USDT"
-    - "LTC/USDT:USDT"
-    - "ALGO/USDT:USDT"
 
   # Fixed at 5m. The strategy's bar counts (ATR 14, 30d percentile, 3-bar entry
   # validity, 12-bar time stop) are all defined against 5m bars.
@@ -85,18 +77,14 @@ strategy:
   p: 30      # ATR percentile floor
 
 runtime:
-  # 20s at 20 symbols. reconcile costs ~2 requests per symbol (open orders and
-  # today's fills are per-symbol calls on Bitget) plus a handful of account
-  # calls, so a full loop is ~45 requests. At 20s that is ~2.3/sec, comfortably
-  # under the 4/sec limiter in orders.py.
+  # At ONE symbol a loop costs ~6 requests (reconcile is a few account calls
+  # plus 2 per symbol) and candles only refetch when a bar has actually closed.
+  # That is ~0.4/sec against the 4/sec limiter -- plenty of headroom, so the
+  # interval can be tight again.
   #
-  # Candle fetches are NOT in that budget: the bar cache only refetches once a
-  # new bar has actually closed, so they cost ~2 requests per loop on average
-  # rather than 40.
-  #
-  # If you add more symbols, raise this proportionally or the limiter throttles
-  # and the loop silently falls behind its own interval.
-  loop_interval_seconds: 20.0
+  # If you add symbols back, raise this: the budget is roughly 2 requests per
+  # symbol per loop, and the limiter throttles silently once it is exceeded.
+  loop_interval_seconds: 15.0
   heartbeat_seconds: 300.0
   kill_file: "KILL"
 
