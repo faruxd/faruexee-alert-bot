@@ -69,6 +69,11 @@ class StrategyParams:
     s: Decimal = Decimal("1.25")  # stop distance, in ATR units
     p: Decimal = Decimal("30")  # ATR percentile floor
 
+    # NOT a fourth tunable. The convention is a 30-day trailing window; this
+    # expresses that in BARS, which differs per timeframe. Hardcoding 8640
+    # silently meant "360 days" at 1h and "30 days" only at 5m.
+    lookback_bars: int = PERCENTILE_LOOKBACK_BARS
+
     def __post_init__(self) -> None:
         if self.k <= 0:
             raise ValueError(f"k must be positive, got {self.k}")
@@ -76,6 +81,11 @@ class StrategyParams:
             raise ValueError(f"s must be positive, got {self.s}")
         if not (0 <= self.p <= 100):
             raise ValueError(f"p must be a percentile in [0, 100], got {self.p}")
+        if self.lookback_bars < 100:
+            raise ValueError(
+                f"lookback_bars={self.lookback_bars} is too short for a percentile "
+                "to mean anything"
+            )
 
 
 @dataclass(frozen=True)
@@ -196,6 +206,7 @@ def check_atr_percentile(
     atrs: Sequence[Optional[Decimal]],
     signal_index: int,
     p: Decimal,
+    lookback_bars: int = PERCENTILE_LOOKBACK_BARS,
 ) -> RegimeVerdict:
     """
     Require ATR[i-1] to sit within [p-th, 90th] percentile of the TRAILING
@@ -214,15 +225,15 @@ def check_atr_percentile(
     if reference_atr is None:
         return RegimeVerdict(False, "ATR not yet warmed up")
 
-    window_start = max(0, reference_index - PERCENTILE_LOOKBACK_BARS + 1)
+    window_start = max(0, reference_index - lookback_bars + 1)
     window = [a for a in atrs[window_start : reference_index + 1] if a is not None]
 
-    if len(window) < PERCENTILE_LOOKBACK_BARS:
+    if len(window) < lookback_bars:
         # Fail closed. Without a full 30 days the percentile is not the statistic
         # the strategy was specified against, and we do not trade on a proxy.
         return RegimeVerdict(
             False,
-            f"insufficient ATR history: {len(window)}/{PERCENTILE_LOOKBACK_BARS} bars",
+            f"insufficient ATR history: {len(window)}/{lookback_bars} bars",
         )
 
     floor = percentile(window, p)
@@ -258,6 +269,7 @@ def evaluate(
     funding_rate: Optional[Decimal],
     params: StrategyParams,
     in_settlement_blackout: bool,
+    precomputed_atrs: Optional[Sequence[Optional[Decimal]]] = None,
 ) -> Optional[Signal]:
     """
     Evaluate the most recent CLOSED bar and return a Signal, or None.
@@ -285,8 +297,10 @@ def evaluate(
     if not funding_verdict.passed:
         return None
 
-    atrs = atr_series(bars)
-    atr_verdict = check_atr_percentile(atrs, signal_index, params.p)
+    atrs = precomputed_atrs if precomputed_atrs is not None else atr_series(bars)
+    atr_verdict = check_atr_percentile(
+        atrs, signal_index, params.p, params.lookback_bars
+    )
     if not atr_verdict.passed:
         return None
 

@@ -40,6 +40,7 @@ from cf_bot.scalper import evaluate as evaluate_scalper
 from cf_bot.scalper import BAR_MS_5M, BAR_MS_15M
 from cf_bot.strategy import (
     ENTRY_VALID_BARS,
+    atr_series,
     TIME_STOP_BARS,
     Bar,
     StrategyParams,
@@ -158,6 +159,17 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
     else:
         signal_window = trend_window = 0
 
+    # Forced flow: compute the ATR series ONCE over the whole set and hand the
+    # strategy a slice. Recomputing an 8640-bar Wilder ATR on every one of
+    # 105,000 bars is ~900M Decimal operations and never finishes. After ~100
+    # bars of smoothing the seed is gone, so a full-series ATR and a
+    # window-seeded one are identical to far more precision than matters.
+    ff_atrs = None
+    if not config.is_scalper:
+        if config.signal_factor > 1:
+            bars = resample(bars, config.signal_factor)
+        ff_atrs = atr_series(bars)
+
     trend_bar_ms = config.trend_factor * BAR_MS_5M
     # Close time of each trend bar, for an O(log n) "which had closed by now".
     trend_close_ts = [b.timestamp_ms + trend_bar_ms for b in trend_bars]
@@ -212,12 +224,14 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
                 in_settlement_blackout=in_blackout,
             )
         else:
+            lo = max(0, i + 1 - (config.params.lookback_bars + 64))
             signal = evaluate(
                 symbol=config.symbol,
-                bars=bars[: i + 1],
+                bars=bars[lo : i + 1],
                 funding_rate=config.assumed_funding,
                 params=config.params,
                 in_settlement_blackout=in_blackout,
+                precomputed_atrs=ff_atrs[lo : i + 1],
             )
 
         if signal is None:
