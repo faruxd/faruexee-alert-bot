@@ -202,10 +202,43 @@ def test_multiple_symbols_are_accepted(write_config, valid_config_yaml):
     assert settings.exchange.symbols == ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
 
-@pytest.mark.parametrize("bad_timeframe", ["1m", "15m", "1h", "5min"])
-def test_timeframe_other_than_5m_is_rejected(write_config, valid_config_yaml, bad_timeframe):
-    """The strategy's fixed bar counts are defined against 5m and do not transfer."""
+@pytest.mark.parametrize("bad_timeframe", ["1m", "5min", "7m", "1d", ""])
+def test_unsupported_timeframe_is_rejected(write_config, valid_config_yaml, bad_timeframe):
+    """A typo must crash, not silently fall back to a default."""
     text = valid_config_yaml.replace('timeframe: "5m"', f'timeframe: "{bad_timeframe}"')
+    with pytest.raises(ConfigError):
+        load_settings(write_config(text))
+
+
+@pytest.mark.parametrize("signal,trend", [("5m","15m"), ("15m","30m"), ("15m","1h"),
+                                          ("30m","1h"), ("1h","4h")])
+def test_supported_timeframe_pairs_load(write_config, valid_config_yaml, signal, trend):
+    text = valid_config_yaml.replace(
+        'timeframe: "5m"', f'timeframe: "{signal}"\n  trend_timeframe: "{trend}"'
+    )
+    settings = load_settings(write_config(text))
+    assert settings.exchange.timeframe == signal
+    assert settings.exchange.trend_timeframe == trend
+
+
+@pytest.mark.parametrize("signal,trend", [("30m","15m"), ("1h","1h"), ("4h","30m")])
+def test_trend_must_be_longer_than_signal(write_config, valid_config_yaml, signal, trend):
+    """It is the HIGHER-timeframe filter. Equal or shorter is a config error."""
+    text = valid_config_yaml.replace(
+        'timeframe: "5m"', f'timeframe: "{signal}"\n  trend_timeframe: "{trend}"'
+    )
+    with pytest.raises(ConfigError):
+        load_settings(write_config(text))
+
+
+def test_trend_must_be_a_whole_multiple_of_signal(write_config, valid_config_yaml):
+    """
+    30m into 4h divides; 30m into a hypothetical 45m would not. Bars that do not
+    share boundaries mean the trend filter reads a partly formed candle.
+    """
+    text = valid_config_yaml.replace(
+        'timeframe: "5m"', 'timeframe: "2h"\n  trend_timeframe: "1h"'
+    )
     with pytest.raises(ConfigError):
         load_settings(write_config(text))
 

@@ -9,34 +9,37 @@
 # =============================================================================
 
 exchange:
-  # Symbols scanned each loop, in priority order. The bot holds at most ONE
-  # position across ALL of them (see guards.MAX_CONCURRENT_POSITIONS), so this
-  # list widens the search for a signal -- it does not multiply risk.
-  # Selected by 24h quote volume on Bitget, crypto only.
-  #
-  # DELIBERATELY EXCLUDED: Bitget's highest-volume perps after BTC/ETH are
-  # tokenized equities and commodities -- SNDK, MU, NVDA, SKHYNIX, SAMSUNG,
-  # INTC, MRVL, CRCL, XAU, XAG, CL -- plus leveraged ETFs like SOXL/SOXS/KORU.
-  # They only move during traditional market hours and they GAP overnight and
-  # over weekends. A 0.2% stop cannot survive a 3% gap, and an EMA cross on an
-  # instrument that is closed two thirds of the day is noise. Crypto only.
-  # BTC only.
+  # BTC ONLY.
   #
   # Twenty correlated crypto pairs all cross at the same moment when the whole
   # market moves, so the bot fired three entries inside ten minutes -- one
   # directional bet taken three times, all stopped out together. A single symbol
-  # removes that failure mode outright: one signal source, and the max-1-position
-  # rule then genuinely means one bet.
+  # removes that failure mode: one signal source, and the max-1-position rule
+  # then genuinely means one bet.
   #
-  # It also means far fewer signals, so the 3-entries-per-day cap will rarely
-  # bind and entries stop being decided by whatever happened to fire first
-  # after 00:00 UTC.
+  # It also means far fewer signals, so the 3-per-day cap rarely binds and
+  # entries stop being decided by whichever pair happened to fire first after
+  # 00:00 UTC.
   symbols:
     - "BTC/USDT:USDT"
 
-  # Fixed at 5m. The strategy's bar counts (ATR 14, 30d percentile, 3-bar entry
-  # validity, 12-bar time stop) are all defined against 5m bars.
-  timeframe: "5m"
+  # Signal timeframe: the EMA fast/slow cross is evaluated on closed bars of
+  # this size. Raised from 5m.
+  #
+  # Measured on a year of BTC: at 5m the round-trip fee costs 0.56R before the
+  # market moves; at 15m it is 0.29R. Profit factor went 0.17 -> 0.48 on that
+  # change alone. It does NOT make the strategy profitable -- gross P&L is still
+  # negative -- it loses more slowly.
+  timeframe: "15m"
+
+  # Trend timeframe: the higher-timeframe EMA(ema_trend) that sets direction.
+  # Must be a whole multiple of `timeframe`, or the two series do not share bar
+  # boundaries and the filter reads a partly formed candle.
+  #
+  # The 2x vs 4x ratio measured as noise (PF 0.48 / 0.41 / 0.45 at 2x / 3x / 4x).
+  # The signal timeframe does the work here, not the ratio.
+  trend_timeframe: "30m"
+
   product_type: "USDT-FUTURES"
   margin_coin: "USDT"
 
@@ -52,23 +55,22 @@ strategy:
   name: "ema_scalper"
 
   # --- ema_scalper -----------------------------------------------------------
-  # 15m EMA(ema_trend) sets direction; a 5m EMA(fast)/EMA(slow) cross in that
-  # direction triggers the entry.
+  # EMA(ema_trend) on the TREND timeframe sets direction; an
+  # EMA(fast)/EMA(slow) cross on the SIGNAL timeframe, in that direction,
+  # triggers the entry.
   ema_fast: 9
   ema_slow: 21
   ema_trend: 50
 
-  # Stop distance in ATR(14) units on the 5m.
+  # Stop distance in ATR(14) units, measured on the signal timeframe.
   #
-  # DO NOT tighten this without doing the fee arithmetic. Position size is
-  # equity*risk / stop_distance, and fees are charged on notional, so halving
-  # the stop doubles the notional AND doubles the fee cost per unit of risk.
-  # At 1.5x ATR (~0.5% on BTC 5m) a taker round trip costs roughly 0.25R.
-  # At 0.5x ATR it costs roughly 0.75R, which no realistic edge survives.
+  # DO NOT tighten this without redoing the fee arithmetic. Position size is
+  # equity*risk / stop_distance and fees are charged on notional, so halving the
+  # stop doubles the notional AND doubles the fee cost per unit of risk.
   atr_mult: 1.5
 
-  # Target as a multiple of risk. A 2R target keeps the fee drag a smaller
-  # fraction of each winner.
+  # Target as a multiple of risk. A 2R target keeps fee drag a smaller fraction
+  # of each winner.
   target_r: 2.0
 
   # --- forced_flow (unused while name is ema_scalper) ------------------------
@@ -77,13 +79,12 @@ strategy:
   p: 30      # ATR percentile floor
 
 runtime:
-  # At ONE symbol a loop costs ~6 requests (reconcile is a few account calls
-  # plus 2 per symbol) and candles only refetch when a bar has actually closed.
-  # That is ~0.4/sec against the 4/sec limiter -- plenty of headroom, so the
-  # interval can be tight again.
+  # At ONE symbol a loop costs ~6 requests: a few account calls plus 2 per
+  # symbol. Candles only refetch once a bar has actually closed, so they cost
+  # almost nothing. That is well under the 4/sec limiter in orders.py.
   #
-  # If you add symbols back, raise this: the budget is roughly 2 requests per
-  # symbol per loop, and the limiter throttles silently once it is exceeded.
+  # If you add symbols back, raise this. The budget is roughly 2 requests per
+  # symbol per loop and the limiter throttles silently once it is exceeded.
   loop_interval_seconds: 15.0
   heartbeat_seconds: 300.0
   kill_file: "KILL"

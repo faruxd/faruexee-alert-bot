@@ -203,7 +203,7 @@ def build_guard_context(state: AccountState, order_timestamps: tuple[int, ...]) 
     )
 
 
-def time_stop_due(position: Position, now_ms: int) -> bool:
+def time_stop_due(position: Position, now_ms: int, bar_ms: int = BAR_MS_5M) -> bool:
     """
     True once the position has been open for TIME_STOP_BARS bars.
 
@@ -213,11 +213,15 @@ def time_stop_due(position: Position, now_ms: int) -> bool:
     """
     if position.opened_at_ms is None:
         return False
-    return now_ms >= position.opened_at_ms + TIME_STOP_BARS * BAR_MS_5M
+    return now_ms >= position.opened_at_ms + TIME_STOP_BARS * bar_ms
 
 
 async def handle_open_positions(
-    client: BitgetClient, state: AccountState, log, limiter: RateLimiter
+    client: BitgetClient,
+    state: AccountState,
+    log,
+    limiter: RateLimiter,
+    bar_ms: int = BAR_MS_5M,
 ) -> bool:
     """Exit work. Runs regardless of guard state. Returns True if anything was flattened."""
     acted = False
@@ -236,7 +240,7 @@ async def handle_open_positions(
             acted = True
             continue
 
-        if time_stop_due(position, now_ms):
+        if time_stop_due(position, now_ms, bar_ms):
             await flatten(
                 client,
                 position.symbol,
@@ -332,12 +336,18 @@ async def _scan_ema_scalper(
     percentile window to fill.
     """
     settings = config.settings.strategy
+    signal_tf = config.settings.exchange.timeframe
+    trend_tf = config.settings.exchange.trend_timeframe
     params = ScalperParams(
         ema_fast=settings.ema_fast,
         ema_slow=settings.ema_slow,
         ema_trend=settings.ema_trend,
         atr_mult=settings.atr_mult,
         target_r=settings.target_r,
+        # Stamps expiry and time-stop times on the Signal in the RIGHT unit.
+        # Leaving this at 5m while trading 15m bars would make the time stop
+        # fire three times too early.
+        bar_ms=timeframe_to_ms(signal_tf),
     )
     in_blackout = guards.in_settlement_blackout(state.fetched_at_ms)
 
@@ -347,10 +357,10 @@ async def _scan_ema_scalper(
     for symbol in client.symbols:
         try:
             signal_bars = await trader.bars.refresh(
-                client, symbol, SIGNAL_TIMEFRAME, signal_needed, limiter, state.fetched_at_ms
+                client, symbol, signal_tf, signal_needed, limiter, state.fetched_at_ms
             )
             trend_bars = await trader.bars.refresh(
-                client, symbol, TREND_TIMEFRAME, trend_needed, limiter, state.fetched_at_ms
+                client, symbol, trend_tf, trend_needed, limiter, state.fetched_at_ms
             )
         except ExchangeError as exc:
             log.warning("scan.ohlcv_failed", symbol=symbol, error=str(exc))
@@ -494,7 +504,9 @@ async def run_iteration(
     Raises UnprotectedPositionError if a position could not be protected or
     closed -- the caller must halt on that, not continue.
     """
-    await handle_open_positions(client, state, log, limiter)
+    await handle_open_positions(
+        client, state, log, limiter, timeframe_to_ms(config.settings.exchange.timeframe)
+    )
 
     for symbol in client.symbols:
         try:
@@ -502,7 +514,7 @@ async def run_iteration(
                 client,
                 symbol,
                 state.fetched_at_ms,
-                ENTRY_VALID_BARS * BAR_MS_5M,
+                ENTRY_VALID_BARS * timeframe_to_ms(config.settings.exchange.timeframe),
                 log,
                 limiter,
             )

@@ -146,6 +146,18 @@ def resolve_mode(env: Optional[Mapping[str, str]] = None) -> str:
 # config.yaml
 # ---------------------------------------------------------------------------
 
+# Timeframes the bot will run on, in milliseconds. The strategy is bar-count
+# based and so is timeframe-agnostic; this list exists to reject typos and to
+# validate the signal/trend relationship.
+SUPPORTED_TIMEFRAMES = {
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+}
+
 _STRICT = ConfigDict(extra="forbid", frozen=True)
 # extra="forbid" matters more than it looks: it turns a typo'd config key into a
 # startup crash instead of a silently ignored setting the operator believes is
@@ -168,7 +180,12 @@ class ExchangeSettings(BaseModel):
     symbols: list[str] = Field(
         description="ccxt unified symbols to scan, e.g. ['BTC/USDT:USDT', ...]"
     )
-    timeframe: str = "5m"
+    # Signal timeframe: the EMA cross is evaluated on closed bars of this size.
+    timeframe: str = "15m"
+    # Trend timeframe: the higher-timeframe EMA that sets direction. Must be a
+    # whole multiple of the signal timeframe, or the two series do not line up
+    # on bar boundaries and the filter reads a candle that is still forming.
+    trend_timeframe: str = "30m"
     product_type: str = "USDT-FUTURES"
     margin_coin: str = "USDT"
 
@@ -192,18 +209,33 @@ class ExchangeSettings(BaseModel):
 
         return cleaned
 
-    @field_validator("timeframe")
+    @field_validator("timeframe", "trend_timeframe")
     @classmethod
-    def _timeframe_is_5m(cls, v: str) -> str:
-        # The strategy's fixed conventions -- ATR period, percentile lookback in
-        # days, entry validity in bars, time stop in bars -- are all specified
-        # against 5m bars. Another timeframe would silently reinterpret all four.
-        if v.strip() != "5m":
+    def _known_timeframe(cls, v: str) -> str:
+        v = v.strip()
+        if v not in SUPPORTED_TIMEFRAMES:
             raise ValueError(
-                f"timeframe must be '5m', got {v!r}. The strategy's fixed bar counts "
-                "are defined against 5m and do not transfer to another timeframe."
+                f"timeframe {v!r} is not supported. Choose from "
+                f"{sorted(SUPPORTED_TIMEFRAMES, key=lambda t: SUPPORTED_TIMEFRAMES[t])}."
             )
-        return v.strip()
+        return v
+
+    @model_validator(mode="after")
+    def _trend_is_a_whole_multiple_of_signal(self) -> "ExchangeSettings":
+        signal = SUPPORTED_TIMEFRAMES[self.timeframe]
+        trend = SUPPORTED_TIMEFRAMES[self.trend_timeframe]
+        if trend <= signal:
+            raise ValueError(
+                f"trend_timeframe ({self.trend_timeframe}) must be LONGER than "
+                f"timeframe ({self.timeframe}); it is the higher-timeframe filter."
+            )
+        if trend % signal != 0:
+            raise ValueError(
+                f"trend_timeframe ({self.trend_timeframe}) must be a whole multiple "
+                f"of timeframe ({self.timeframe}), or their bars do not share "
+                "boundaries and the trend filter reads a partly formed candle."
+            )
+        return self
 
 
 class RiskSettings(BaseModel):
@@ -428,6 +460,7 @@ class AppConfig:
             "mode": self.mode,
             "symbols": list(self.settings.exchange.symbols),
             "timeframe": self.settings.exchange.timeframe,
+            "trend_timeframe": self.settings.exchange.trend_timeframe,
             "product_type": self.settings.exchange.product_type,
             "margin_coin": self.settings.exchange.margin_coin,
             "risk_pct": f"{self.settings.risk.risk_pct}%",
