@@ -37,6 +37,7 @@ from cf_bot.scalper import (
     ScalperParams,
 )
 from cf_bot.scalper import evaluate as evaluate_scalper
+from cf_bot.scalper import ema_series
 from cf_bot.scalper import BAR_MS_5M, BAR_MS_15M
 from cf_bot.strategy import (
     ENTRY_VALID_BARS,
@@ -91,12 +92,24 @@ class BacktestConfig:
     signal_factor: int = 1      # 1=5m, 3=15m, 12=1h, 48=4h
     trend_factor: int = 3       # conventionally 3-4x the signal timeframe
 
+    # Exit when the fast/slow EMAs cross back the other way. A trend-following
+    # exit: it lets a winner run past the fixed target instead of capping it.
+    exit_on_opposite_cross: bool = False
+    # With a cross exit the fixed target is usually removed, so the winner is
+    # not truncated at 2R -- that is the entire point of holding to the cross.
+    use_target: bool = True
+    # A cross can take tens of bars to arrive, so the time stop has to be long
+    # enough that it is not the thing actually ending every trade.
+    time_stop_bars_override: Optional[int] = None
+
     @property
     def is_scalper(self) -> bool:
         return self.scalper_params is not None
 
     @property
     def time_stop_bars(self) -> int:
+        if self.time_stop_bars_override is not None:
+            return self.time_stop_bars_override
         return SCALPER_TIME_STOP_BARS if self.is_scalper else TIME_STOP_BARS
 
 
@@ -169,6 +182,22 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
         if config.signal_factor > 1:
             bars = resample(bars, config.signal_factor)
         ff_atrs = atr_series(bars)
+
+    # Cross direction at every bar, computed once. Used by the opposite-cross
+    # exit; recomputing EMAs inside the exit walk would be O(n^2) again.
+    cross_at: list[Optional[str]] = []
+    if config.is_scalper and config.exit_on_opposite_cross:
+        closes = [b.close for b in bars]
+        fast = ema_series(closes, scalper.ema_fast)
+        slow = ema_series(closes, scalper.ema_slow)
+        cross_at = [None]*len(bars)
+        for i in range(1, len(bars)):
+            if None in (fast[i], fast[i-1], slow[i], slow[i-1]):
+                continue
+            if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:
+                cross_at[i] = "long"
+            elif fast[i-1] >= slow[i-1] and fast[i] < slow[i]:
+                cross_at[i] = "short"
 
     trend_bar_ms = config.trend_factor * BAR_MS_5M
     # Close time of each trend bar, for an O(log n) "which had closed by now".
@@ -276,6 +305,7 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
             signal=signal,
             qty=qty,
             config=config,
+            cross_at=cross_at,
         )
         trades.append(trade)
 
@@ -300,6 +330,7 @@ def _simulate_exit(
     signal,
     qty: Decimal,
     config: BacktestConfig,
+    cross_at: Optional[list] = None,
 ) -> Trade:
     """
     Walk forward from the fill bar to whichever exit comes first.
@@ -333,11 +364,26 @@ def _simulate_exit(
             exit_is_maker = False
             break
 
-        if target_hit(bar, side, signal.target_price):
+        if config.use_target and target_hit(bar, side, signal.target_price):
             exit_price = signal.target_price
             exit_ts = bar.timestamp_ms
             exit_reason = "target"
             exit_is_maker = True  # resting reduce-only limit
+            break
+
+        # Opposite cross: the trend that justified the trade has turned. Exits
+        # at that bar's close and pays taker -- it is a market exit, not a
+        # resting limit that happened to be hit.
+        if (
+            cross_at
+            and index > fill_index
+            and cross_at[index] is not None
+            and cross_at[index] != side
+        ):
+            exit_price = bar.close
+            exit_ts = bar.timestamp_ms
+            exit_reason = "opposite_cross"
+            exit_is_maker = False
             break
 
     if exit_price is None:

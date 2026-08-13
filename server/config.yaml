@@ -27,18 +27,27 @@ exchange:
   # this size. Raised 5m -> 15m -> 30m.
   #
   # Measured on a year of BTC, round-trip fee cost per unit of risk:
-  #     5m  0.56R      15m  0.29R      30m  0.20R
-  # Profit factor followed: 0.17 -> 0.48 -> 0.58. It does NOT make the strategy
-  # profitable -- gross P&L is still negative -- it loses more slowly.
-  timeframe: "30m"
+  #     5m 0.56R   15m 0.29R   30m 0.20R   1h 0.14R
+  #
+  # Net loss over that year fell 999 -> 893 -> 552 -> 227, and max drawdown
+  # 99.9% -> 89.3% -> 58.7% -> 24.1%. GROSS stayed around -50, which is the
+  # point: raising the timeframe removes friction, it does not create an edge.
+  # This is the least-bad configuration measured, not a profitable one.
+  timeframe: "1h"
 
   # Trend timeframe: the higher-timeframe EMA(ema_trend) that sets direction.
   # Must be a whole multiple of `timeframe`, or the two series do not share bar
   # boundaries and the filter reads a partly formed candle.
   #
-  # The 2x vs 4x ratio measured as noise (PF 0.48 / 0.41 / 0.45 at 2x / 3x / 4x).
-  # The signal timeframe does the work here, not the ratio.
-  trend_timeframe: "1h"
+  # The ratio itself measures as noise; the signal timeframe does the work.
+  #
+  # An opposite-CROSS exit was tested here and rejected on the data: gross went
+  # -50 (2R target) -> -63 (cross + target) -> -88 (cross only). Letting the
+  # winner run loses more than taking 2R, which is what happens when the signal
+  # has no predictive power -- extra room just gives gains back. Re-tested with
+  # the settlement flatten disabled in case it was masking the cross, and gross
+  # was worse again at -99.
+  trend_timeframe: "4h"
 
   product_type: "USDT-FUTURES"
   margin_coin: "USDT"
