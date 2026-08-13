@@ -38,6 +38,17 @@ class ExchangeError(Exception):
     """Any failure talking to Bitget."""
 
 
+class InsufficientBalance(ExchangeError):
+    """
+    The venue refused the order for margin, not for price.
+
+    Distinct from OrderRejected because the response differs: a post-only
+    rejection means "a passive fill is impossible, take it at market", but an
+    insufficient-balance rejection means the order is unaffordable in ANY form.
+    Retrying it as a market order just collects a second rejection.
+    """
+
+
 class OrderRejected(ExchangeError):
     """
     The venue refused the order and retrying it unchanged will not help.
@@ -88,6 +99,24 @@ def timeframe_to_ms(timeframe: str) -> int:
         raise ExchangeError(
             f"unknown timeframe {timeframe!r}; known: {sorted(_TIMEFRAME_MS)}"
         ) from None
+
+
+# Bitget's code for "The order amount exceeds the balance".
+INSUFFICIENT_BALANCE_CODES = ("40762", "40754", "43012")
+
+
+def _classify_rejection(symbol: str, exc: Exception, what: str) -> ExchangeError:
+    """
+    Separate "cannot afford this" from "cannot fill this passively".
+
+    Conflating them made the bot answer a margin rejection by resending the very
+    same unaffordable order as a market order -- two rejections, one signal, and
+    a log that read as though post-only had merely been unlucky.
+    """
+    text = str(exc)
+    if any(code in text for code in INSUFFICIENT_BALANCE_CODES) or "exceeds the balance" in text:
+        return InsufficientBalance(f"{what} unaffordable for {symbol}: {exc}")
+    return OrderRejected(f"{what} rejected for {symbol}: {exc}")
 
 
 def utc_day_start_ms(now: Optional[datetime] = None) -> int:
@@ -457,7 +486,7 @@ class BitgetClient:
                 params,
             )
         except _FINAL_REJECTION_TYPES as exc:
-            raise OrderRejected(f"entry rejected for {symbol}: {exc}") from exc
+            raise _classify_rejection(symbol, exc, "entry") from exc
         except Exception as exc:
             raise ExchangeError(f"entry submission failed for {symbol}: {exc}") from exc
 
@@ -502,7 +531,7 @@ class BitgetClient:
                 params,
             )
         except _FINAL_REJECTION_TYPES as exc:
-            raise OrderRejected(f"market entry rejected for {symbol}: {exc}") from exc
+            raise _classify_rejection(symbol, exc, "market entry") from exc
         except Exception as exc:
             raise ExchangeError(f"market entry failed for {symbol}: {exc}") from exc
 

@@ -24,13 +24,13 @@ exchange:
     - "BTC/USDT:USDT"
 
   # Signal timeframe: the EMA fast/slow cross is evaluated on closed bars of
-  # this size. Raised from 5m.
+  # this size. Raised 5m -> 15m -> 30m.
   #
-  # Measured on a year of BTC: at 5m the round-trip fee costs 0.56R before the
-  # market moves; at 15m it is 0.29R. Profit factor went 0.17 -> 0.48 on that
-  # change alone. It does NOT make the strategy profitable -- gross P&L is still
-  # negative -- it loses more slowly.
-  timeframe: "15m"
+  # Measured on a year of BTC, round-trip fee cost per unit of risk:
+  #     5m  0.56R      15m  0.29R      30m  0.20R
+  # Profit factor followed: 0.17 -> 0.48 -> 0.58. It does NOT make the strategy
+  # profitable -- gross P&L is still negative -- it loses more slowly.
+  timeframe: "30m"
 
   # Trend timeframe: the higher-timeframe EMA(ema_trend) that sets direction.
   # Must be a whole multiple of `timeframe`, or the two series do not share bar
@@ -38,7 +38,7 @@ exchange:
   #
   # The 2x vs 4x ratio measured as noise (PF 0.48 / 0.41 / 0.45 at 2x / 3x / 4x).
   # The signal timeframe does the work here, not the ratio.
-  trend_timeframe: "30m"
+  trend_timeframe: "1h"
 
   product_type: "USDT-FUTURES"
   margin_coin: "USDT"

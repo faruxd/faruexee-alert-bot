@@ -36,6 +36,7 @@ from cf_bot.exchange import (
     BitgetClient,
     DemoModeRefusal,
     ExchangeError,
+    InsufficientBalance,
     OrderRejected,
 )
 from cf_bot.ids import (
@@ -146,6 +147,8 @@ async def _with_retry(operation, description: str, log, limiter: RateLimiter):
         try:
             return await operation()
         except DemoModeRefusal:
+            raise
+        except InsufficientBalance:
             raise
         except OrderRejected as exc:
             log.error("order.rejected", operation=description, error=str(exc), attempt=attempt)
@@ -548,6 +551,10 @@ async def place_entry_limit_then_market(
             log,
             limiter,
         )
+    except InsufficientBalance:
+        # NOT a post-only problem. The order is unaffordable in any form, so
+        # falling back to market would just collect a second rejection.
+        raise
     except OrderRejected as exc:
         # Post-only rejects when the price has already moved through our level.
         # That is not a failure -- it is the venue telling us a passive fill is
