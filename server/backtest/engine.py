@@ -89,8 +89,11 @@ class BacktestConfig:
     scalper_params: Optional[ScalperParams] = None
     # How many 5m bars make one SIGNAL bar and one TREND bar. The input series
     # is always 5m; both are resampled from it so the two can never disagree.
-    signal_factor: int = 1      # 1=5m, 3=15m, 12=1h, 48=4h
+    signal_factor: int = 1      # multiples of input_bar_ms
     trend_factor: int = 3       # conventionally 3-4x the signal timeframe
+    # Size of the bars handed in. Everything downstream is expressed in
+    # multiples of this, so a series that is not 5m resamples correctly.
+    input_bar_ms: int = BAR_MS_5M
 
     # Exit when the fast/slow EMAs cross back the other way. A trend-following
     # exit: it lets a winner run past the fixed target instead of capping it.
@@ -150,9 +153,9 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
     # Both series are resampled from the SAME 5m input, so the trend filter can
     # never disagree with the signal series about what price did.
     if config.is_scalper:
-        trend_bars = resample(bars, config.trend_factor)
+        trend_bars = resample(bars, config.trend_factor, config.input_bar_ms)
         if config.signal_factor > 1:
-            bars = resample(bars, config.signal_factor)
+            bars = resample(bars, config.signal_factor, config.input_bar_ms)
     else:
         trend_bars = []
 
@@ -180,7 +183,7 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
     ff_atrs = None
     if not config.is_scalper:
         if config.signal_factor > 1:
-            bars = resample(bars, config.signal_factor)
+            bars = resample(bars, config.signal_factor, config.input_bar_ms)
         ff_atrs = atr_series(bars)
 
     # Cross direction at every bar, computed once. Used by the opposite-cross
@@ -199,7 +202,7 @@ def run_backtest(bars: Sequence[Bar], config: BacktestConfig) -> tuple[list[Trad
             elif fast[i-1] >= slow[i-1] and fast[i] < slow[i]:
                 cross_at[i] = "short"
 
-    trend_bar_ms = config.trend_factor * BAR_MS_5M
+    trend_bar_ms = config.trend_factor * config.input_bar_ms
     # Close time of each trend bar, for an O(log n) "which had closed by now".
     trend_close_ts = [b.timestamp_ms + trend_bar_ms for b in trend_bars]
 

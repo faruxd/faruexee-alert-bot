@@ -152,9 +152,13 @@ def save_csv(bars: list[Bar], path: Path) -> None:
             )
 
 
-def resample(bars: list[Bar], factor: int) -> list[Bar]:
+def resample(bars: list[Bar], factor: int, input_bar_ms: int = BAR_MS_5M) -> list[Bar]:
     """
     Aggregate `factor` consecutive bars into one (5m -> 15m at factor 3).
+
+    `input_bar_ms` is the size of the bars being passed in. It used to be
+    assumed 5m, which silently mis-bucketed any other input -- resampling 1h
+    bars by 4 would have aligned them to 20-minute boundaries.
 
     Buckets are aligned to wall-clock boundaries of the TARGET timeframe, not to
     the start of the array. Aligning to the array would produce 15m bars at
@@ -172,7 +176,7 @@ def resample(bars: list[Bar], factor: int) -> list[Bar]:
     if not bars:
         return []
 
-    target_ms = BAR_MS_5M * factor
+    target_ms = input_bar_ms * factor
     buckets: dict[int, list[Bar]] = {}
     for candle in bars:
         bucket_ts = (candle.timestamp_ms // target_ms) * target_ms
