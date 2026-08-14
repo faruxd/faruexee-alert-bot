@@ -322,17 +322,21 @@ def detect_smc_structure(candles, lookback=10, body_break=True):
 
     A CHoCH is a direction FLIP; a BOS is a continuation break.
 
-    Returns: (direction_str, choch_ts)
+    Returns: (direction_str, choch_ts, origin_bar_ts)
       direction_str : "bullish" | "bearish" | "neutral"
       choch_ts      : timestamp (ms, int) of the last CHoCH that set the
                       current direction, or None if still neutral.
+      origin_bar_ts : timestamp of the pivot bar that CAUSED the CHoCH
+                      (swing low for bullish CHoCH, swing high for bearish).
+                      This is the origin block — zones near this bar are the
+                      high-probability pullback targets.
     """
     if not candles or len(candles) < lookback + 10:
-        return "neutral", None
+        return "neutral", None, None
 
     closed = candles[:-1]           # drop live candle
     if len(closed) < lookback + 10:
-        return "neutral", None
+        return "neutral", None, None
 
     highs  = [float(c[2]) for c in closed]
     lows   = [float(c[3]) for c in closed]
@@ -383,12 +387,13 @@ def detect_smc_structure(candles, lookback=10, body_break=True):
         return best_i if best_i is not None else min_i
 
     # ── State ──
-    direction     = 0
-    struct_high   = highs[0]
-    struct_low    = lows[0]
-    high_idx      = 0
-    low_idx       = 0
-    last_choch_ts = None
+    direction      = 0
+    struct_high    = highs[0]
+    struct_low     = lows[0]
+    high_idx       = 0
+    low_idx        = 0
+    last_choch_ts  = None
+    origin_bar_ts  = None       # timestamp of the pivot that caused the last CHoCH
 
     for i in range(4, n):
         # Break prices — body (close) or wick (high/low)
@@ -429,6 +434,9 @@ def detect_smc_structure(candles, lookback=10, body_break=True):
             # BOS if already bearish, CHoCH if flipping direction
             if direction != 1:
                 last_choch_ts = ts[i]
+                # Origin of a bearish CHoCH = swing HIGH that price fell from
+                new_high_idx  = find_pivot_high_bar(i)
+                origin_bar_ts = ts[new_high_idx]
             direction   = 1
             high_idx    = find_pivot_high_bar(i)
             struct_high = highs[high_idx]
@@ -438,6 +446,9 @@ def detect_smc_structure(candles, lookback=10, body_break=True):
         elif is_high_broken:
             if direction != 2:
                 last_choch_ts = ts[i]
+                # Origin of a bullish CHoCH = swing LOW that price bounced from
+                new_low_idx   = find_pivot_low_bar(i)
+                origin_bar_ts = ts[new_low_idx]
             direction   = 2
             high_idx    = i
             struct_high = highs[i]
@@ -454,10 +465,10 @@ def detect_smc_structure(candles, lookback=10, body_break=True):
                 low_idx     = i
 
     if direction == 2:
-        return "bullish", last_choch_ts
+        return "bullish", last_choch_ts, origin_bar_ts
     if direction == 1:
-        return "bearish", last_choch_ts
-    return "neutral", None
+        return "bearish", last_choch_ts, origin_bar_ts
+    return "neutral", None, None
 
 
 def run_indicator(candles):
@@ -955,6 +966,151 @@ def send_discord_tap_alert(symbol, timeframe, zone_info):
 
 
 # =============================================================
+#   🎯  CHoCH ORIGIN ZONE DETECTION & ALERTS
+# =============================================================
+
+# ± window around the CHoCH origin bar to consider a zone as its "origin"
+ORIGIN_MATCH_WINDOW_MS = 4 * 60 * 60 * 1000   # ±4 hours
+
+
+def find_origin_zone(active_zones, side, origin_bar_ts, choch_ts):
+    """
+    Find the zone that caused a CHoCH — i.e. the demand/supply zone that price
+    bounced from to break structure.
+
+    Rules:
+    - Zone side must match the CHoCH direction (bullish CHoCH → demand)
+    - Zone must have formed BEFORE the CHoCH bar
+    - Zone timestamp must be within ORIGIN_MATCH_WINDOW_MS of the pivot origin bar
+    - If multiple qualify, pick the one closest to the origin bar timestamp
+    """
+    if not origin_bar_ts:
+        return None
+    origin_bar_ts = int(origin_bar_ts)
+    choch_ts_int  = int(choch_ts) if choch_ts else None
+
+    candidates = []
+    for z in active_zones:
+        if z["side"] != side:
+            continue
+        z_ts = int(z.get("created_ts", 0))
+        if choch_ts_int and z_ts >= choch_ts_int:
+            continue                      # zone formed AFTER CHoCH — not the origin
+        if abs(z_ts - origin_bar_ts) > ORIGIN_MATCH_WINDOW_MS:
+            continue                      # too far from the pivot bar
+        candidates.append(z)
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda z: abs(int(z["created_ts"]) - origin_bar_ts))
+
+
+def send_choch_origin_alert(symbol, direction, choch_ts, origins):
+    """
+    Discord alert fired when a new 4H CHoCH is detected AND at least one
+    origin zone has been identified across the scanned timeframes.
+    """
+    is_bull = direction == "bullish"
+    color   = 0x1976D2   # blue — distinct from green/red/orange
+    arrow   = "🔷⬆️" if is_bull else "🔷⬇️"
+
+    fields = [{
+        "name":   "Structure Shift",
+        "value":  f"{arrow}  **4H {direction.upper()} CHoCH detected**",
+        "inline": False,
+    }]
+
+    for tf, zone in origins.items():
+        if zone is None:
+            continue
+        side_lbl   = "Demand" if zone["side"] == "buy" else "Supply"
+        zone_range = f"`{round(zone['zone_bot'], 6)}  —  {round(zone['zone_top'], 6)}`"
+        fields.append({
+            "name":   f"{tf} Origin {side_lbl} Zone",
+            "value":  (f"{zone_range}\n"
+                       f"SL: `{round(zone['sl'], 6)}`   "
+                       f"TP1: `{round(zone['tp1'], 6)}`"),
+            "inline": False,
+        })
+
+    fields.append({
+        "name":   "What this means",
+        "value":  ("This is the zone that caused the CHoCH. "
+                   "High-probability pullback target — watch for price to return here."),
+        "inline": False,
+    })
+
+    embed = {
+        "title":     f"🎯  CHoCH Origin Zone  |  {symbol}  4H",
+        "color":     color,
+        "fields":    fields,
+        "footer":    {"text": "FARUEXEE Alert Bot"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code == 204:
+            return True
+        print(f"  [ERROR] Origin alert returned {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        print(f"  [ERROR] Origin alert send failed: {e}")
+        return False
+
+
+def send_origin_tap_alert(symbol, tf, zone):
+    """Discord alert fired when price taps a CHoCH origin zone."""
+    is_long   = zone["side"] == "buy"
+    direction = "LONG  —  Origin Demand" if is_long else "SHORT  —  Origin Supply"
+    arrow     = "🎯⬆️" if is_long else "🎯⬇️"
+
+    sl_dist = abs(zone["entry"] - zone["sl"])
+    rr1     = round(abs(zone["tp1"] - zone["entry"]) / sl_dist, 2) if sl_dist > 0 else "—"
+
+    tp_lines = [f"`{round(zone['tp1'], 6)}`  *(1:{rr1}R)*"]
+    if zone.get("tp2") is not None:
+        rr2 = round(abs(zone["tp2"] - zone["entry"]) / sl_dist, 2) if sl_dist > 0 else "—"
+        tp_lines.append(f"`{round(zone['tp2'], 6)}`  *(1:{rr2}R)*")
+    if zone.get("tp3") is not None:
+        rr3 = round(abs(zone["tp3"] - zone["entry"]) / sl_dist, 2) if sl_dist > 0 else "—"
+        tp_lines.append(f"`{round(zone['tp3'], 6)}`  *(1:{rr3}R)*")
+
+    zone_range = f"`{round(zone['zone_bot'], 6)}  —  {round(zone['zone_top'], 6)}`"
+
+    fields = [
+        {"name": "Direction",          "value": f"{arrow}  **{direction}**", "inline": False},
+        {"name": "Zone (Entry Range)", "value": zone_range,                  "inline": True},
+        {"name": "Stop Loss",          "value": f"`{round(zone['sl'], 6)}`", "inline": True},
+        {"name": "​",             "value": "​",                    "inline": True},
+        {"name": f"Take Profit  ({len(tp_lines)} target{'s' if len(tp_lines) > 1 else ''})",
+         "value": "\n".join(tp_lines), "inline": False},
+        {"name": "Setup Note",
+         "value": ("**CHoCH origin zone tapped.** Price returned to the zone that "
+                   "caused the 4H structure break — high-probability continuation setup."),
+         "inline": False},
+    ]
+
+    embed = {
+        "title":     f"🎯  Origin Zone Tapped  |  {symbol}  {tf}",
+        "color":     0x1976D2,   # blue
+        "fields":    fields,
+        "footer":    {"text": "FARUEXEE Alert Bot"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code == 204:
+            return True
+        print(f"  [ERROR] Origin tap alert returned {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        print(f"  [ERROR] Origin tap alert send failed: {e}")
+        return False
+
+
+# =============================================================
 #   💾  STATE MANAGEMENT
 # =============================================================
 
@@ -988,18 +1144,37 @@ def run_bot():
 
     for symbol in SYMBOLS:
         # ── SMC CHoCH state (computed once per symbol, applied to all TFs) ──
-        smc_direction = "neutral"
-        smc_choch_ts  = None
+        smc_direction   = "neutral"
+        smc_choch_ts    = None
+        smc_origin_ts   = None
         if USE_SMC_CHOCH_FILTER:
             smc_candles = get_candles(symbol, SMC_CHOCH_TIMEFRAME, limit=200)
             if smc_candles:
-                smc_direction, smc_choch_ts = detect_smc_structure(
+                smc_direction, smc_choch_ts, smc_origin_ts = detect_smc_structure(
                     smc_candles,
                     lookback   = SMC_STRUCT_LOOKBACK,
                     body_break = SMC_BODY_BREAK,
                 )
             print(f"\n  [SMC {SMC_CHOCH_TIMEFRAME}] {symbol} → {smc_direction.upper()}"
-                  + (f"  (CHoCH ts: {smc_choch_ts})" if smc_choch_ts else ""))
+                  + (f"  (CHoCH ts: {smc_choch_ts}, origin ts: {smc_origin_ts})"
+                     if smc_choch_ts else ""))
+
+        # ── CHoCH Origin tracking state (persisted across scans) ──
+        origin_state_key = f"{symbol}_smcOrigin"
+        origin_state     = state.get(origin_state_key, {})
+
+        # New CHoCH detected? Reset origin tracking.
+        if smc_choch_ts and origin_state.get("choch_ts") != smc_choch_ts:
+            print(f"  [SMC] New CHoCH detected — resetting origin tracking.")
+            origin_state = {
+                "choch_ts":      smc_choch_ts,
+                "direction":     smc_direction,
+                "origin_bar_ts": smc_origin_ts,
+                "origins":       {tf: None for tf in TIMEFRAMES},
+                "alerted":       False,
+                "tap_alerted":   {tf: False for tf in TIMEFRAMES},
+            }
+            state[origin_state_key] = origin_state
 
         for tf in TIMEFRAMES:
             key_prefix = f"{symbol}_{tf}"
@@ -1032,6 +1207,43 @@ def run_bot():
             if inside_fvg:
                 print(f"  Inside FVG   : yes (tap alerts blocked)")
             zones_found += len(active_zones)
+
+            # ── CHoCH Origin: search for origin zone on this TF if not yet found ──
+            if (USE_SMC_CHOCH_FILTER
+                    and smc_direction != "neutral"
+                    and origin_state.get("choch_ts")
+                    and origin_state.get("origins", {}).get(tf) is None):
+                needed_side = "buy" if smc_direction == "bullish" else "sell"
+                origin_zone = find_origin_zone(
+                    active_zones,
+                    needed_side,
+                    origin_state.get("origin_bar_ts"),
+                    origin_state.get("choch_ts"),
+                )
+                if origin_zone:
+                    print(f"  [CHoCH Origin] Found on {tf}: {origin_zone['zone_id'][:50]}")
+                    origin_state["origins"][tf] = origin_zone
+                    state[origin_state_key] = origin_state
+
+            # ── CHoCH Origin: check if a stored origin zone is being tapped ──
+            stored_origin = origin_state.get("origins", {}).get(tf)
+            if (stored_origin
+                    and not origin_state.get("tap_alerted", {}).get(tf, False)
+                    and not _is_first_run):
+                live_high = float(candles[-1][2])
+                live_low  = float(candles[-1][3])
+                touched   = (
+                    (stored_origin["side"] == "buy"  and live_low  <= stored_origin["zone_top"]) or
+                    (stored_origin["side"] == "sell" and live_high >= stored_origin["zone_bot"])
+                )
+                if touched:
+                    print(f"\n  🎯 CHoCH Origin Zone TAPPED on {tf}! Sending alert...")
+                    if send_origin_tap_alert(symbol, tf, stored_origin):
+                        alerts_sent += 1
+                        origin_state["tap_alerted"][tf] = True
+                        state[origin_state_key] = origin_state
+                    else:
+                        print(f"  [ERROR] Origin tap alert failed — will retry next run.")
 
             # ── Clean up state records for zones no longer active ──
             stale_keys = [
@@ -1173,6 +1385,27 @@ def run_bot():
                     }
                 else:
                     print(f"  [ERROR] Alert failed — will retry next run.")
+
+        # ── CHoCH Origin discovery alert (once per new CHoCH, per symbol) ──
+        if (USE_SMC_CHOCH_FILTER
+                and not _is_first_run
+                and origin_state
+                and not origin_state.get("alerted", False)
+                and origin_state.get("choch_ts")):
+            found_origins = {
+                tf: z for tf, z in origin_state.get("origins", {}).items() if z
+            }
+            if found_origins:
+                print(f"\n  🎯 New CHoCH origin(s) found for {symbol} — sending alert.")
+                if send_choch_origin_alert(
+                    symbol,
+                    origin_state["direction"],
+                    origin_state["choch_ts"],
+                    found_origins,
+                ):
+                    alerts_sent += 1
+                    origin_state["alerted"] = True
+                    state[origin_state_key]  = origin_state
 
         # Save after every symbol — so a crash mid-run doesn't lose sent alerts
         save_state(state)
