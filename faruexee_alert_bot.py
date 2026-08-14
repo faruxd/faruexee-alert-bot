@@ -85,6 +85,14 @@ HTF_MAP = {                # Fix F — which HTF to check per scanning timeframe
 
 TP_MULTI          = 2.0    # TP Fallback multiplier (when no opposing zone found)
 
+# ── SMC CHoCH Confluence Filter ──
+# Only alert zones/taps that align with the current 4H CHoCH direction
+# AND that formed AFTER the CHoCH was established.
+USE_SMC_CHOCH_FILTER = True
+SMC_CHOCH_TIMEFRAME  = "4H"    # Timeframe to compute CHoCH state on
+SMC_STRUCT_LOOKBACK  = 10      # Pivot lookback bars (matches Pine Script default)
+SMC_BODY_BREAK       = True    # Use close price for structure break (body candle)
+
 # State file — tracks which zones have already been alerted
 STATE_FILE = "alert_state.json"
 
@@ -303,6 +311,155 @@ def compute_htf_trend(candles):
     return trends[-1]
 
 
+def detect_smc_structure(candles, lookback=10, body_break=True):
+    """
+    Replicates LudoGH68's SMC Structures Pine Script — BOS/CHoCH detection.
+
+    Bar-by-bar simulation of the structure state machine:
+      direction 0 = neutral (initial)
+      direction 1 = bearish (last flip was a broken low)
+      direction 2 = bullish (last flip was a broken high)
+
+    A CHoCH is a direction FLIP; a BOS is a continuation break.
+
+    Returns: (direction_str, choch_ts)
+      direction_str : "bullish" | "bearish" | "neutral"
+      choch_ts      : timestamp (ms, int) of the last CHoCH that set the
+                      current direction, or None if still neutral.
+    """
+    if not candles or len(candles) < lookback + 10:
+        return "neutral", None
+
+    closed = candles[:-1]           # drop live candle
+    if len(closed) < lookback + 10:
+        return "neutral", None
+
+    highs  = [float(c[2]) for c in closed]
+    lows   = [float(c[3]) for c in closed]
+    closes = [float(c[4]) for c in closed]
+    ts     = [int(c[0])   for c in closed]
+    n      = len(closed)
+
+    def find_pivot_high_bar(bar_i):
+        """Find the anchor bar for a new high after a bullish break.
+        Matches Pine's get_structure_highest_bar within a lookback window."""
+        lb      = min(lookback, bar_i + 1)
+        max_i   = bar_i
+        max_val = -float("inf")
+        for j in range(bar_i - lb + 1, bar_i + 1):
+            if highs[j] > max_val:
+                max_val = highs[j]
+                max_i   = j
+        best_i = None
+        for i in range(0, lb - 2):
+            b0 = bar_i - i
+            b1 = bar_i - i - 1
+            b2 = bar_i - i - 2
+            if b2 < 0:
+                break
+            if highs[b1] > highs[b2] and highs[b0] <= highs[b1]:
+                if b1 >= max_i:
+                    best_i = b1
+        return best_i if best_i is not None else max_i
+
+    def find_pivot_low_bar(bar_i):
+        lb      = min(lookback, bar_i + 1)
+        min_i   = bar_i
+        min_val = float("inf")
+        for j in range(bar_i - lb + 1, bar_i + 1):
+            if lows[j] < min_val:
+                min_val = lows[j]
+                min_i   = j
+        best_i = None
+        for i in range(0, lb - 2):
+            b0 = bar_i - i
+            b1 = bar_i - i - 1
+            b2 = bar_i - i - 2
+            if b2 < 0:
+                break
+            if lows[b1] < lows[b2] and lows[b0] >= lows[b1]:
+                if b1 <= min_i:
+                    best_i = b1
+        return best_i if best_i is not None else min_i
+
+    # ── State ──
+    direction     = 0
+    struct_high   = highs[0]
+    struct_low    = lows[0]
+    high_idx      = 0
+    low_idx       = 0
+    last_choch_ts = None
+
+    for i in range(4, n):
+        # Break prices — body (close) or wick (high/low)
+        low_break_i   = closes[i]     if body_break else lows[i]
+        low_break_1   = closes[i - 1] if body_break else lows[i - 1]
+        low_break_2   = closes[i - 2] if body_break else lows[i - 2]
+        low_break_3   = closes[i - 3] if body_break else lows[i - 3]
+        high_break_i  = closes[i]     if body_break else highs[i]
+        high_break_1  = closes[i - 1] if body_break else highs[i - 1]
+        high_break_2  = closes[i - 2] if body_break else highs[i - 2]
+        high_break_3  = closes[i - 3] if body_break else highs[i - 3]
+
+        fresh_low_broken = (
+            low_break_i < struct_low
+            and low_break_1 >= struct_low
+            and low_break_2 >= struct_low
+            and low_break_3 >= struct_low
+            and (i - 1) > low_idx
+            and (i - 2) > low_idx
+            and (i - 3) > low_idx
+        )
+        continuation_low_broken = direction == 2 and low_break_i < struct_low
+        is_low_broken           = fresh_low_broken or continuation_low_broken
+
+        fresh_high_broken = (
+            high_break_i > struct_high
+            and high_break_1 <= struct_high
+            and high_break_2 <= struct_high
+            and high_break_3 <= struct_high
+            and (i - 1) > high_idx
+            and (i - 2) > high_idx
+            and (i - 3) > high_idx
+        )
+        continuation_high_broken = direction == 1 and high_break_i > struct_high
+        is_high_broken           = fresh_high_broken or continuation_high_broken
+
+        if is_low_broken:
+            # BOS if already bearish, CHoCH if flipping direction
+            if direction != 1:
+                last_choch_ts = ts[i]
+            direction   = 1
+            high_idx    = find_pivot_high_bar(i)
+            struct_high = highs[high_idx]
+            low_idx     = i
+            struct_low  = lows[i]
+
+        elif is_high_broken:
+            if direction != 2:
+                last_choch_ts = ts[i]
+            direction   = 2
+            high_idx    = i
+            struct_high = highs[i]
+            low_idx     = find_pivot_low_bar(i)
+            struct_low  = lows[low_idx]
+
+        else:
+            # Extend running levels while trend runs
+            if highs[i] > struct_high and direction in (0, 2):
+                struct_high = highs[i]
+                high_idx    = i
+            elif lows[i] < struct_low and direction in (0, 1):
+                struct_low  = lows[i]
+                low_idx     = i
+
+    if direction == 2:
+        return "bullish", last_choch_ts
+    if direction == 1:
+        return "bearish", last_choch_ts
+    return "neutral", None
+
+
 def run_indicator(candles):
     """
     FARUEXEE indicator — IMMEDIATE TAP ALERT MODE.
@@ -387,15 +544,16 @@ def run_indicator(candles):
                     # Fire on first tap (no rejection close required)
                     if i == n - 1:
                         tapped_cands.append({
-                            "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
-                            "side":     "buy",
-                            "zone_top": z["top"],
-                            "zone_bot": z["bot"],
-                            "entry":    z["entry"],
-                            "sl":       z["sl"],
-                            "tp1":      z["tp1"],
-                            "tp2":      z["tp2"],
-                            "tp3":      z["tp3"],
+                            "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
+                            "side":       "buy",
+                            "zone_top":   z["top"],
+                            "zone_bot":   z["bot"],
+                            "entry":      z["entry"],
+                            "sl":         z["sl"],
+                            "tp1":        z["tp1"],
+                            "tp2":        z["tp2"],
+                            "tp3":        z["tp3"],
+                            "created_ts": z["ts"],
                         })
                     # zone consumed regardless
             elif is_in:
@@ -419,15 +577,16 @@ def run_indicator(candles):
                     # Fire on first tap (no rejection close required)
                     if i == n - 1:
                         tapped_cands.append({
-                            "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                            "side":     "sell",
-                            "zone_top": z["top"],
-                            "zone_bot": z["bot"],
-                            "entry":    z["entry"],
-                            "sl":       z["sl"],
-                            "tp1":      z["tp1"],
-                            "tp2":      z["tp2"],
-                            "tp3":      z["tp3"],
+                            "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                            "side":       "sell",
+                            "zone_top":   z["top"],
+                            "zone_bot":   z["bot"],
+                            "entry":      z["entry"],
+                            "sl":         z["sl"],
+                            "tp1":        z["tp1"],
+                            "tp2":        z["tp2"],
+                            "tp3":        z["tp3"],
+                            "created_ts": z["ts"],
                         })
             elif is_in:
                 new_supply.append({**z, "was_in": True})
@@ -500,27 +659,29 @@ def run_indicator(candles):
     active_zones = []
     for z in demand_zones:
         active_zones.append({
-            "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
-            "side":     "buy",
-            "zone_top": z["top"],
-            "zone_bot": z["bot"],
-            "entry":    z["entry"],
-            "sl":       z["sl"],
-            "tp1":      z["tp1"],
-            "tp2":      z["tp2"],
-            "tp3":      z["tp3"],
+            "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
+            "side":       "buy",
+            "zone_top":   z["top"],
+            "zone_bot":   z["bot"],
+            "entry":      z["entry"],
+            "sl":         z["sl"],
+            "tp1":        z["tp1"],
+            "tp2":        z["tp2"],
+            "tp3":        z["tp3"],
+            "created_ts": z["ts"],
         })
     for z in supply_zones:
         active_zones.append({
-            "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
-            "side":     "sell",
-            "zone_top": z["top"],
-            "zone_bot": z["bot"],
-            "entry":    z["entry"],
-            "sl":       z["sl"],
-            "tp1":      z["tp1"],
-            "tp2":      z["tp2"],
-            "tp3":      z["tp3"],
+            "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
+            "side":       "sell",
+            "zone_top":   z["top"],
+            "zone_bot":   z["bot"],
+            "entry":      z["entry"],
+            "sl":         z["sl"],
+            "tp1":        z["tp1"],
+            "tp2":        z["tp2"],
+            "tp3":        z["tp3"],
+            "created_ts": z["ts"],
         })
 
     # ── Immediate live candle tap detection ──
@@ -535,15 +696,16 @@ def run_indicator(candles):
             if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
                 continue
             tapped_cands.append({
-                "zone_id":  f"demand_{z['ts']}_{round(z['top'], 6)}",
-                "side":     "buy",
-                "zone_top": z["top"],
-                "zone_bot": z["bot"],
-                "entry":    z["entry"],
-                "sl":       z["sl"],
-                "tp1":      z["tp1"],
-                "tp2":      z["tp2"],
-                "tp3":      z["tp3"],
+                "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
+                "side":       "buy",
+                "zone_top":   z["top"],
+                "zone_bot":   z["bot"],
+                "entry":      z["entry"],
+                "sl":         z["sl"],
+                "tp1":        z["tp1"],
+                "tp2":        z["tp2"],
+                "tp3":        z["tp3"],
+                "created_ts": z["ts"],
             })
 
     for z in supply_zones:
@@ -551,15 +713,16 @@ def run_indicator(candles):
             if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
                 continue
             tapped_cands.append({
-                "zone_id":  f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                "side":     "sell",
-                "zone_top": z["top"],
-                "zone_bot": z["bot"],
-                "entry":    z["entry"],
-                "sl":       z["sl"],
-                "tp1":      z["tp1"],
-                "tp2":      z["tp2"],
-                "tp3":      z["tp3"],
+                "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
+                "side":       "sell",
+                "zone_top":   z["top"],
+                "zone_bot":   z["bot"],
+                "entry":      z["entry"],
+                "sl":         z["sl"],
+                "tp1":        z["tp1"],
+                "tp2":        z["tp2"],
+                "tp3":        z["tp3"],
+                "created_ts": z["ts"],
             })
 
     # Dedupe — closed-bar tap and live tap can pick up the same zone in one scan
@@ -824,6 +987,20 @@ def run_bot():
     zones_found  = 0
 
     for symbol in SYMBOLS:
+        # ── SMC CHoCH state (computed once per symbol, applied to all TFs) ──
+        smc_direction = "neutral"
+        smc_choch_ts  = None
+        if USE_SMC_CHOCH_FILTER:
+            smc_candles = get_candles(symbol, SMC_CHOCH_TIMEFRAME, limit=200)
+            if smc_candles:
+                smc_direction, smc_choch_ts = detect_smc_structure(
+                    smc_candles,
+                    lookback   = SMC_STRUCT_LOOKBACK,
+                    body_break = SMC_BODY_BREAK,
+                )
+            print(f"\n  [SMC {SMC_CHOCH_TIMEFRAME}] {symbol} → {smc_direction.upper()}"
+                  + (f"  (CHoCH ts: {smc_choch_ts})" if smc_choch_ts else ""))
+
         for tf in TIMEFRAMES:
             key_prefix = f"{symbol}_{tf}"
             print(f"\n  Scanning {symbol} | {tf}")
@@ -872,11 +1049,28 @@ def run_bot():
                     del state[tap_key]
 
             if not _is_first_run:
-                # ── Tap alerts — closed bar, rejection close, HTF + FVG filtered ──
+                # ── Tap alerts — closed bar, rejection close, HTF + FVG + SMC filtered ──
                 for zone in tapped_zones:
                     tap_key = f"{key_prefix}_tapAlerted_{zone['zone_id']}"
                     if tap_key in state:
                         continue   # already alerted for this zone tap
+
+                    # ── SMC CHoCH confluence filter ──
+                    if USE_SMC_CHOCH_FILTER:
+                        if smc_direction == "neutral":
+                            print(f"  Tap blocked — 4H SMC neutral: {zone['zone_id'][:40]}...")
+                            continue
+                        if zone["side"] == "buy"  and smc_direction != "bullish":
+                            print(f"  Tap blocked — 4H SMC not bullish: {zone['zone_id'][:40]}...")
+                            continue
+                        if zone["side"] == "sell" and smc_direction != "bearish":
+                            print(f"  Tap blocked — 4H SMC not bearish: {zone['zone_id'][:40]}...")
+                            continue
+                        # Zone must have formed AFTER the CHoCH
+                        zone_ts = int(zone.get("created_ts", 0))
+                        if smc_choch_ts and zone_ts <= int(smc_choch_ts):
+                            print(f"  Tap blocked — zone predates 4H CHoCH: {zone['zone_id'][:40]}...")
+                            continue
 
                     # Fix F: HTF filter — only alert when HTF trend agrees
                     if USE_HTF_FILTER and htf_trend != 0:
@@ -931,6 +1125,22 @@ def run_bot():
                         "alerted_at": datetime.now().isoformat()
                     }
                     continue
+
+                # ── SMC CHoCH confluence filter ──
+                if USE_SMC_CHOCH_FILTER:
+                    if smc_direction == "neutral":
+                        print(f"  New zone blocked — 4H SMC neutral: {zone['zone_id'][:40]}...")
+                        continue
+                    if zone["side"] == "buy"  and smc_direction != "bullish":
+                        print(f"  New zone blocked — 4H SMC not bullish: {zone['zone_id'][:40]}...")
+                        continue
+                    if zone["side"] == "sell" and smc_direction != "bearish":
+                        print(f"  New zone blocked — 4H SMC not bearish: {zone['zone_id'][:40]}...")
+                        continue
+                    zone_ts = int(zone.get("created_ts", 0))
+                    if smc_choch_ts and zone_ts <= int(smc_choch_ts):
+                        print(f"  New zone blocked — predates 4H CHoCH: {zone['zone_id'][:40]}...")
+                        continue
 
                 # New zone appeared after startup — send alert
                 side  = zone["side"]
