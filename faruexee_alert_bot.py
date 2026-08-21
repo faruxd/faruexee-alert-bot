@@ -73,8 +73,10 @@ ATR_LEN           = 14     # Fix E — ATR period
 ATR_MULT          = 0.5    # Fix E — ATR SL multiplier
 SL_BUFFER         = 0.25   # Fallback SL buffer × zone height (only when ATR disabled)
 MIN_RR            = 1.5    # Fix D — reject zones where TP1 < N × SL distance
-FIRE_ON_2ND_TEST  = False  # Fire on first tap (immediate alert mode)
+FIRE_ON_2ND_TEST  = True   # Fix G — Pine default; fire on 2nd test (1st tap = tested, 2nd = alert)
+REQUIRE_REJECTION = True   # Pine entry signal requires close > zone_top (demand) / close < zone_bot (supply)
 USE_HTF_FILTER    = True   # Fix F — only alert when HTF trend agrees
+USE_FVG_FILTER    = False  # Pine default — showImb=false; FVG filter off
 
 HTF_MAP = {                # Fix F — which HTF to check per scanning timeframe
     "30m": "1H",
@@ -550,10 +552,13 @@ def run_indicator(candles):
             if new_tap:
                 new_taps = z.get("taps", 0) + 1
                 if FIRE_ON_2ND_TEST and new_taps < 2:
+                    # 1st tap — Pine keeps zone alive (tested), no alert
                     new_demand.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    # Fire on first tap (no rejection close required)
-                    if i == n - 1:
+                    # Fire alert on 2nd tap (or 1st if FIRE_ON_2ND_TEST=False).
+                    # Pine entry requires rejection close: close > zone_top.
+                    rejection_ok = (not REQUIRE_REJECTION) or (closes[i] > z["top"])
+                    if i == n - 1 and rejection_ok:
                         tapped_cands.append({
                             "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
                             "side":       "buy",
@@ -566,7 +571,14 @@ def run_indicator(candles):
                             "tp3":        z["tp3"],
                             "created_ts": z["ts"],
                         })
-                    # zone consumed regardless
+                    # Pine: on 2nd tap the zone is deleted. On 1st tap w/o rejection,
+                    # keep zone alive so a future rejection can fire.
+                    if FIRE_ON_2ND_TEST:
+                        # 2nd tap — always consume zone (Pine deletes)
+                        pass
+                    else:
+                        # 1st tap mode — consume regardless
+                        pass
             elif is_in:
                 new_demand.append({**z, "was_in": True})
             else:
@@ -583,10 +595,12 @@ def run_indicator(candles):
             if new_tap:
                 new_taps = z.get("taps", 0) + 1
                 if FIRE_ON_2ND_TEST and new_taps < 2:
+                    # 1st tap — Pine keeps zone alive (tested), no alert
                     new_supply.append({**z, "taps": new_taps, "was_in": True})
                 else:
-                    # Fire on first tap (no rejection close required)
-                    if i == n - 1:
+                    # 2nd tap fire. Pine entry requires rejection close: close < zone_bot.
+                    rejection_ok = (not REQUIRE_REJECTION) or (closes[i] < z["bot"])
+                    if i == n - 1 and rejection_ok:
                         tapped_cands.append({
                             "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
                             "side":       "sell",
@@ -627,14 +641,13 @@ def run_indicator(candles):
                     tp1 = tp_cands[0] if tp_cands else entry + (entry - sl_px) * TP_MULTI
                     tp2 = tp_cands[1] if len(tp_cands) >= 2 else None
                     tp3 = tp_cands[2] if len(tp_cands) >= 3 else None
-                    sl_d = entry - sl_px
-                    if sl_d > 0 and (tp1 - entry) / sl_d >= MIN_RR:   # Fix D
-                        demand_zones.append({
-                            "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
-                            "entry": entry, "sl": sl_px,
-                            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                            "taps": 0, "was_in": False,
-                        })
+                    # Pine draws all zones — no MIN_RR check here. Enforced at alert time.
+                    demand_zones.append({
+                        "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
+                        "entry": entry, "sl": sl_px,
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                        "taps": 0, "was_in": False,
+                    })
                 else:
                     demand_reg.append({"bar": i, "top": z_top, "bot": z_bot})
 
@@ -655,14 +668,13 @@ def run_indicator(candles):
                     tp1 = tp_cands[0] if tp_cands else entry - (sl_px - entry) * TP_MULTI
                     tp2 = tp_cands[1] if len(tp_cands) >= 2 else None
                     tp3 = tp_cands[2] if len(tp_cands) >= 3 else None
-                    sl_d = sl_px - entry
-                    if sl_d > 0 and (entry - tp1) / sl_d >= MIN_RR:   # Fix D
-                        supply_zones.append({
-                            "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
-                            "entry": entry, "sl": sl_px,
-                            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                            "taps": 0, "was_in": False,
-                        })
+                    # Pine draws all zones — no MIN_RR check here. Enforced at alert time.
+                    supply_zones.append({
+                        "bar": i, "ts": ts[i], "top": z_top, "bot": z_bot,
+                        "entry": entry, "sl": sl_px,
+                        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                        "taps": 0, "was_in": False,
+                    })
                 else:
                     supply_reg.append({"bar": i, "top": z_top, "bot": z_bot})
 
@@ -695,46 +707,52 @@ def run_indicator(candles):
             "created_ts": z["ts"],
         })
 
-    # ── Immediate live candle tap detection ──
-    # Check live (unconfirmed) candle against all active zones.
-    # Fires the moment price wicks into the zone — no waiting for close.
-    live_high = float(live_candle[2])
-    live_low  = float(live_candle[3])
+    # ── Live candle tap detection (Pine entry signal criteria) ──
+    # Fires when live candle wicks into zone AND has closed back outside it.
+    # In 2nd-test mode, zone must already have taps >= 1 (been tested).
+    live_high  = float(live_candle[2])
+    live_low   = float(live_candle[3])
+    live_close = float(live_candle[4])
 
     for z in demand_zones:
-        if live_low <= z["top"]:
-            # In 2nd-test mode, skip if zone hasn't been tapped at least once
-            if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
-                continue
-            tapped_cands.append({
-                "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
-                "side":       "buy",
-                "zone_top":   z["top"],
-                "zone_bot":   z["bot"],
-                "entry":      z["entry"],
-                "sl":         z["sl"],
-                "tp1":        z["tp1"],
-                "tp2":        z["tp2"],
-                "tp3":        z["tp3"],
-                "created_ts": z["ts"],
-            })
+        wick_in      = live_low <= z["top"]
+        rejection_ok = (not REQUIRE_REJECTION) or (live_close > z["top"])
+        if not (wick_in and rejection_ok):
+            continue
+        if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
+            continue
+        tapped_cands.append({
+            "zone_id":    f"demand_{z['ts']}_{round(z['top'], 6)}",
+            "side":       "buy",
+            "zone_top":   z["top"],
+            "zone_bot":   z["bot"],
+            "entry":      z["entry"],
+            "sl":         z["sl"],
+            "tp1":        z["tp1"],
+            "tp2":        z["tp2"],
+            "tp3":        z["tp3"],
+            "created_ts": z["ts"],
+        })
 
     for z in supply_zones:
-        if live_high >= z["bot"]:
-            if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
-                continue
-            tapped_cands.append({
-                "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
-                "side":       "sell",
-                "zone_top":   z["top"],
-                "zone_bot":   z["bot"],
-                "entry":      z["entry"],
-                "sl":         z["sl"],
-                "tp1":        z["tp1"],
-                "tp2":        z["tp2"],
-                "tp3":        z["tp3"],
-                "created_ts": z["ts"],
-            })
+        wick_in      = live_high >= z["bot"]
+        rejection_ok = (not REQUIRE_REJECTION) or (live_close < z["bot"])
+        if not (wick_in and rejection_ok):
+            continue
+        if FIRE_ON_2ND_TEST and z.get("taps", 0) < 1:
+            continue
+        tapped_cands.append({
+            "zone_id":    f"supply_{z['ts']}_{round(z['bot'], 6)}",
+            "side":       "sell",
+            "zone_top":   z["top"],
+            "zone_bot":   z["bot"],
+            "entry":      z["entry"],
+            "sl":         z["sl"],
+            "tp1":        z["tp1"],
+            "tp2":        z["tp2"],
+            "tp3":        z["tp3"],
+            "created_ts": z["ts"],
+        })
 
     # Dedupe — closed-bar tap and live tap can pick up the same zone in one scan
     seen         = set()
@@ -1293,10 +1311,21 @@ def run_bot():
                             print(f"  Tap blocked — HTF not downtrend: {zone['zone_id'][:40]}...")
                             continue
 
-                    # Fix B: FVG filter — block if price inside recent imbalance
-                    if inside_fvg:
+                    # Fix B: FVG filter (Pine showImb default = false, so off by default)
+                    if USE_FVG_FILTER and inside_fvg:
                         print(f"  Tap blocked — price inside FVG: {zone['zone_id'][:40]}...")
                         continue
+
+                    # Fix D: min RR — Pine checks this on entry signal (not zone creation)
+                    entry_p = zone["entry"]
+                    sl_p    = zone["sl"]
+                    tp1_p   = zone["tp1"]
+                    sl_dist = abs(entry_p - sl_p)
+                    if sl_dist > 0:
+                        rr = abs(tp1_p - entry_p) / sl_dist
+                        if rr < MIN_RR:
+                            print(f"  Tap blocked — RR {rr:.2f} < {MIN_RR}: {zone['zone_id'][:40]}...")
+                            continue
 
                     side = zone["side"]
                     print(f"\n  Zone Tapped! {'⬆️ LONG' if side == 'buy' else '⬇️ SHORT'}")
