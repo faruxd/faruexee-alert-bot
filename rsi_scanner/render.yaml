@@ -22,8 +22,19 @@
 #      Runtime          Python 3
 #      Build Command    pip install -r rsi_scanner/requirements.txt
 #      Start Command    python -m rsi_scanner
-#      Schedule         10 0 * * *          (UTC, always -- Render ignores
-#                                            your local timezone here)
+#      Schedule         5 0,4,8,12,16,20 * * *
+#
+#                       UTC always -- Render ignores your local timezone.
+#                       Six runs a day, five minutes after each 4H bar
+#                       closes. ONLY the 00:05 run can report a 1D signal,
+#                       because that is the only one where the UTC day has
+#                       also just closed.
+#
+#                       DO NOT set this to */10 or similar. That fires
+#                       between bar closes, and every run re-reads the same
+#                       already-reported bar. The duplicate guard now makes
+#                       that harmless -- such runs post nothing -- but it is
+#                       still 144 pointless builds a day.
 #      Instance Type    the smallest available
 #
 #  ── Sizing ──
@@ -69,6 +80,14 @@
 #                                          explicitly so the dashboard shows
 #                                          the real value rather than relying
 #                                          on a code default that could drift)
+#      MAX_BAR_AGE_MINUTES      90         (a bar older than this is a
+#                                          re-read, not news -- the run
+#                                          posts nothing. Render Cron is
+#                                          reliable, so 30 is also fine here;
+#                                          keep it loose on GitHub Actions,
+#                                          whose runs are often 30 min late)
+#      BIAS_MIDLINE             50         (4H resets fire only when the
+#                                          daily RSI is on the same side)
 #      DAY_BOUNDARY             utc        (resample 4H -> true UTC days;
 #                                           'exchange' uses Bitget's native 1D
 #                                           bars, which close at 16:00 UTC)
@@ -91,7 +110,7 @@ services:
     plan: starter
     region: oregon
     branch: main
-    schedule: "10 0 * * *"
+    schedule: "5 0,4,8,12,16,20 * * *"
     buildCommand: pip install -r rsi_scanner/requirements.txt
     startCommand: python -m rsi_scanner
 
@@ -100,6 +119,8 @@ services:
         sync: false
       - key: RSI_PERIOD
         value: "7"
+      - key: MAX_BAR_AGE_MINUTES
+        value: "90"
       - key: DAY_BOUNDARY
         value: utc
       - key: POST_WHEN_EMPTY

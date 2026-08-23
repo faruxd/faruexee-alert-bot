@@ -151,3 +151,62 @@ def daily_closes(
     raw = fetch_candles(symbol, "4H", limit=1000, session=session)
     closed_4h = drop_forming_bar(raw, MS_PER_4H, now_ms=now_ms)
     return resample_4h_to_utc_days(closed_4h)
+
+
+# ---------------------------------------------------------------------------
+# Intraday timeframes and bar freshness
+# ---------------------------------------------------------------------------
+
+# Granularity -> bar length in ms. Bitget spells these with a capital H.
+TIMEFRAME_MS = {
+    "4H": MS_PER_4H,
+    "1H": 3_600_000,
+    "1D": MS_PER_DAY,
+}
+
+
+def intraday_closes(
+    symbol: str,
+    timeframe: str = "4H",
+    session: Optional[requests.Session] = None,
+    now_ms: Optional[int] = None,
+) -> List[List[float]]:
+    """
+    Closed bars for an intraday timeframe, oldest -> newest.
+
+    Unlike daily_closes() there is no resampling: Bitget's 4H bars already sit
+    on UTC boundaries (00/04/08/12/16/20), so they need no correction. It is
+    only the 1D bar that is cut at 16:00 UTC.
+    """
+    if timeframe not in TIMEFRAME_MS:
+        raise ValueError(f"unsupported timeframe {timeframe!r}")
+    raw = fetch_candles(symbol, timeframe, limit=1000, session=session)
+    return drop_forming_bar(raw, TIMEFRAME_MS[timeframe], now_ms=now_ms)
+
+
+def bars_for(
+    symbol: str,
+    timeframe: str,
+    boundary: str = "utc",
+    session: Optional[requests.Session] = None,
+    now_ms: Optional[int] = None,
+) -> List[List[float]]:
+    """Closed bars for any supported timeframe. 1D honours the day boundary."""
+    if timeframe == "1D":
+        return daily_closes(symbol, boundary=boundary, session=session, now_ms=now_ms)
+    return intraday_closes(symbol, timeframe, session=session, now_ms=now_ms)
+
+
+def bar_age_minutes(bar_ts_ms: int, timeframe: str, now_ms: Optional[int] = None) -> float:
+    """
+    Minutes since the bar CLOSED (not since it opened).
+
+    This is what the duplicate guard keys on. A bar that closed two minutes ago
+    is news; the same bar eight hours later is a scheduler that is firing too
+    often, and re-posting it would spam the channel with a signal the user has
+    already seen.
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    closed_at = bar_ts_ms + TIMEFRAME_MS[timeframe]
+    return (now_ms - closed_at) / 60_000.0

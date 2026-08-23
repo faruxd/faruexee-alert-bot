@@ -11,7 +11,12 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .rsi import DEFAULT_OVERBOUGHT, DEFAULT_OVERSOLD, DEFAULT_PERIOD
+from .rsi import (
+    DEFAULT_BIAS_MIDLINE,
+    DEFAULT_OVERBOUGHT,
+    DEFAULT_OVERSOLD,
+    DEFAULT_PERIOD,
+)
 from .symbols import default_universe
 
 WEBHOOK_ENV_VAR = "DISCORD_RSI_WEBHOOK"
@@ -25,6 +30,10 @@ class Config:
     oversold: float = DEFAULT_OVERSOLD
     overbought: float = DEFAULT_OVERBOUGHT
     day_boundary: str = "utc"
+    timeframes: List[str] = field(default_factory=lambda: ["1D", "4H"])
+    bias_midline: float = DEFAULT_BIAS_MIDLINE
+    # A bar older than this is a re-read, not news. See scan._is_fresh.
+    max_bar_age_minutes: float = 90.0
     post_when_empty: bool = False
     request_delay_seconds: float = 0.12
     dry_run: bool = False
@@ -61,6 +70,24 @@ class Config:
         if period < 2:
             raise ValueError("RSI_PERIOD must be >= 2")
 
+        raw_tfs = (env.get("RSI_TIMEFRAMES") or "1D,4H").strip()
+        timeframes = [t.strip().upper() for t in raw_tfs.split(",") if t.strip()]
+        for tf in timeframes:
+            if tf not in ("1D", "4H"):
+                raise ValueError(f"unsupported timeframe {tf!r}; expected 1D or 4H")
+        if "1D" not in timeframes:
+            # The 4H filter reads the daily bias, so the daily series is
+            # fetched either way. Excluding 1D would only hide its signals.
+            raise ValueError("1D cannot be removed; the 4H filter depends on it")
+
+        max_age = float(env.get("MAX_BAR_AGE_MINUTES") or 90.0)
+        if max_age <= 0:
+            raise ValueError("MAX_BAR_AGE_MINUTES must be positive")
+
+        midline = float(env.get("BIAS_MIDLINE") or DEFAULT_BIAS_MIDLINE)
+        if not 0 < midline < 100:
+            raise ValueError("BIAS_MIDLINE must be between 0 and 100")
+
         return cls(
             webhook_url=webhook,
             symbols=symbols,
@@ -68,6 +95,9 @@ class Config:
             oversold=oversold,
             overbought=overbought,
             day_boundary=boundary,
+            timeframes=timeframes,
+            bias_midline=midline,
+            max_bar_age_minutes=max_age,
             post_when_empty=_flag(env.get("POST_WHEN_EMPTY")),
             dry_run=_flag(env.get("RSI_DRY_RUN")),
         )

@@ -16,12 +16,18 @@ from rsi_scanner.scan import ScanResult, Signal
 WEBHOOK = "https://discord.com/api/webhooks/1/abc"
 
 
-def sig(symbol, direction, prev, now, close=100.0, prev_close=98.0, crypto=True):
+def sig(symbol, direction, prev, now, tf="1D", close=100.0, prev_close=98.0,
+        crypto=True, daily_rsi=None):
     return Signal(
-        symbol=symbol, direction=direction, rsi_prev=prev, rsi_now=now,
+        symbol=symbol, direction=direction, timeframe=tf, rsi_prev=prev, rsi_now=now,
         close=close, prev_close=prev_close, bar_ts_ms=1_700_000_000_000,
-        is_crypto=crypto,
+        is_crypto=crypto, daily_rsi=daily_rsi,
     )
+
+
+def res(signals=(), reported=("1D",), **kw):
+    kw.setdefault("scanned", 34)
+    return ScanResult(signals=list(signals), reported=list(reported), **kw)
 
 
 # --------------------------------------------------------------------------
@@ -102,58 +108,98 @@ def test_large_and_small_prices_stay_readable():
 # Digest
 # --------------------------------------------------------------------------
 
-def test_digest_lists_both_directions():
-    result = ScanResult(
-        signals=[sig("BTCUSDT", "bullish", 26.1, 32.6), sig("ETHUSDT", "bearish", 74.0, 68.2)],
-        scanned=29, failures=[],
-    )
-    text = build_digest(result)
-    assert "Bullish reset" in text and "BTC" in text
-    assert "Bearish reset" in text and "ETH" in text
+def test_daily_section_lists_both_directions():
+    text = build_digest(res([
+        sig("BTCUSDT", "bullish", 26.1, 32.6),
+        sig("ETHUSDT", "bearish", 74.0, 68.2),
+    ]))
+    assert "Daily" in text
+    assert "Bullish" in text and "BTC" in text
+    assert "Bearish" in text and "ETH" in text
 
 
 def test_digest_shows_configured_thresholds_not_hardcoded_ones():
-    result = ScanResult(signals=[sig("BTCUSDT", "bullish", 18.0, 21.0)], scanned=29, failures=[])
-    text = build_digest(result, oversold=20.0, overbought=80.0)
-    assert "`20`" in text
-    assert "`30`" not in text
+    text = build_digest(res([sig("BTCUSDT", "bullish", 18.0, 21.0)]),
+                        oversold=20.0, overbought=80.0)
+    assert "`20`" in text and "`30`" not in text
 
 
-def test_empty_scan_says_so_rather_than_rendering_blank_sections():
-    text = build_digest(ScanResult(signals=[], scanned=29, failures=[]))
+def test_timeframe_with_no_fresh_bar_is_omitted_entirely():
+    """
+    A 04:00 run has new 4H information but no new daily. Rendering a "Daily"
+    header there would imply the daily had just closed.
+    """
+    text = build_digest(res([sig("SOLUSDT", "bullish", 26.0, 33.0, tf="4H")],
+                            reported=["4H"]))
+    assert "4-Hour" in text
+    assert "Daily" not in text
+
+
+def test_both_sections_render_when_both_are_fresh():
+    text = build_digest(res(
+        [sig("BTCUSDT", "bearish", 74.0, 68.0, tf="1D"),
+         sig("SOLUSDT", "bullish", 26.0, 33.0, tf="4H", daily_rsi=58.0)],
+        reported=["1D", "4H"],
+    ))
+    assert "Daily" in text and "4-Hour" in text
+    assert text.index("Daily") < text.index("4-Hour")
+
+
+def test_4h_lines_carry_the_daily_rsi_as_context():
+    text = build_digest(res([sig("SOLUSDT", "bullish", 26.0, 33.0, tf="4H", daily_rsi=58.4)],
+                            reported=["4H"]))
+    assert "1D `58`" in text
+
+
+def test_no_fresh_bar_at_all_says_so():
+    """The duplicate-guard case: a run that had nothing new to look at."""
+    text = build_digest(res([], reported=[]))
+    assert "No newly closed bar" in text
+
+
+def test_suppressed_count_is_surfaced():
+    """A silent filter that swallows everything must not look like a quiet market."""
+    text = build_digest(res([], suppressed=7))
+    assert "7" in text and "suppressed" in text
+
+
+def test_empty_scan_says_no_resets():
+    text = build_digest(res([]))
     assert "No resets" in text
-    assert "Bullish reset" not in text
 
 
 def test_failures_are_surfaced_not_hidden():
-    result = ScanResult(signals=[], scanned=27, failures=[("FOOUSDT", "bad"), ("BARUSDT", "bad")])
-    assert "2 failed" in build_digest(result)
+    text = build_digest(res([], failures=[("FOOUSDT", "bad"), ("BARUSDT", "bad")]))
+    assert "2 failed" in text
 
 
 def test_non_crypto_symbols_are_tagged():
-    result = ScanResult(
-        signals=[sig("XAUUSDT", "bullish", 26.0, 31.0, crypto=False)], scanned=29, failures=[]
-    )
-    text = build_digest(result)
+    text = build_digest(res([sig("XAUUSDT", "bullish", 26.0, 31.0, crypto=False)]))
     assert "⧉" in text and "non-crypto" in text
 
 
 def test_digest_stays_under_the_discord_limit_on_a_full_house():
-    """Every symbol firing at once must not produce a rejected 2000+ char post."""
-    signals = [sig(f"SYM{i:02d}USDT", "bullish" if i % 2 else "bearish", 26.0, 31.0)
+    signals = [sig(f"SYM{i:02d}USDT", "bullish" if i % 2 else "bearish", 26.0, 31.0,
+                   tf="1D" if i % 2 else "4H")
                for i in range(40)]
-    text = build_digest(ScanResult(signals=signals, scanned=40, failures=[]))
+    text = build_digest(res(signals, reported=["1D", "4H"]))
     assert len(text) <= 1900
 
 
 def test_crypto_sorts_above_non_crypto():
-    result = ScanResult(
-        signals=[sig("XAUUSDT", "bullish", 25.0, 31.0, crypto=False),
-                 sig("BTCUSDT", "bullish", 29.0, 31.0, crypto=True)],
-        scanned=29, failures=[],
-    )
-    text = build_digest(result)
+    text = build_digest(res([
+        sig("XAUUSDT", "bullish", 25.0, 31.0, crypto=False),
+        sig("BTCUSDT", "bullish", 29.0, 31.0, crypto=True),
+    ]))
     assert text.index("BTC") < text.index("XAU")
+
+
+def test_most_stretched_sorts_first():
+    text = build_digest(res([
+        sig("AAAUSDT", "bearish", 71.0, 69.0),
+        sig("BBBUSDT", "bearish", 88.0, 65.0),
+    ]))
+    assert text.index("BBB") < text.index("AAA")
 
 
 def test_empty_scan_is_dated_by_the_last_closed_bar_not_by_now():
@@ -162,14 +208,5 @@ def test_empty_scan_is_dated_by_the_last_closed_bar_not_by_now():
     and falling back to the wall clock labelled the digest with the date of
     the bar still forming -- i.e. tomorrow.
     """
-    bar_ts = 1_755_734_400_000            # 2025-08-21 00:00 UTC
-    result = ScanResult(signals=[], scanned=29, failures=[], last_bar_ts_ms=bar_ts)
-    assert "2025-08-21" in build_digest(result)
-
-
-def test_signal_timestamp_is_used_when_present():
-    result = ScanResult(
-        signals=[sig("BTCUSDT", "bullish", 26.0, 31.0)], scanned=29, failures=[],
-        last_bar_ts_ms=1_755_734_400_000,
-    )
-    assert "2025-08-21" in build_digest(result)
+    text = build_digest(res([], last_bar_ts_ms=1_755_734_400_000))
+    assert "2025-08-21" in text

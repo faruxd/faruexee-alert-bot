@@ -14,8 +14,13 @@
 #  That prints the digest to the run log and posts nothing.
 #
 #  ── On the schedule ────────────────────────────────────────────────────────
-#  00:10 UTC, ten minutes after the 20:00-00:00 4H bar closes, so the day is
-#  genuinely complete before we read it.
+#  Six runs a day, five minutes after each 4H bar closes. The 00:05 run is the
+#  only one where the UTC day has also just closed, so that is the only run
+#  that can report a 1D signal; the other five carry 4H only.
+#
+#  A run that finds no freshly closed bar posts NOTHING -- see the duplicate
+#  guard in scan._is_fresh. That is what makes a mis-set schedule harmless
+#  rather than a source of repeated identical digests.
 #
 #  GitHub's scheduled runs are best-effort and are routinely late by 5-30
 #  minutes at peak times. That is harmless here BY DESIGN: the scanner decides
@@ -26,11 +31,11 @@
 #  is unacceptable, move this to Render Cron.
 # =============================================================================
 
-name: Daily RSI reset scan
+name: RSI reset scan
 
 on:
   schedule:
-    - cron: "10 0 * * *"
+    - cron: "5 0,4,8,12,16,20 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

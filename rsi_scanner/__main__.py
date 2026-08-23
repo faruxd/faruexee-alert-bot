@@ -42,7 +42,9 @@ def main(argv=None) -> int:
     print(
         f"  symbols={len(config.symbols)}  RSI({config.period})  "
         f"levels={config.oversold:g}/{config.overbought:g}  "
-        f"day={config.day_boundary}  webhook={'yes' if config.webhook_url else 'NO'}"
+        f"tf={','.join(config.timeframes)}  bias>{config.bias_midline:g}  "
+        f"day={config.day_boundary}  max_bar_age={config.max_bar_age_minutes:g}m  "
+        f"webhook={'yes' if config.webhook_url else 'NO'}"
         + ("  [DRY RUN]" if config.dry_run else "")
     )
     print("-" * 62)
@@ -52,8 +54,13 @@ def main(argv=None) -> int:
     print("-" * 62)
     print(
         f"  scanned={result.scanned}  bullish={len(result.bullish)}  "
-        f"bearish={len(result.bearish)}  failed={len(result.failures)}"
+        f"bearish={len(result.bearish)}  suppressed={result.suppressed}  "
+        f"failed={len(result.failures)}"
     )
+    print(f"  fresh timeframes: {result.reported or 'NONE'}")
+    for tf, age in sorted(result.stale.items()):
+        print(f"    {tf} skipped — last bar closed {age:.0f} min ago (limit "
+              f"{config.max_bar_age_minutes:g})")
     if result.bars_available is not None:
         print(f"  daily bars available: {result.bars_available}")
 
@@ -74,6 +81,15 @@ def main(argv=None) -> int:
 
     if config.dry_run:
         print("  [DRY RUN] nothing sent")
+        return 0
+
+    # THE DUPLICATE GUARD. No timeframe had a freshly closed bar, so this run
+    # is a re-read of something already reported -- almost always a schedule
+    # firing too often. Posting again would repeat a digest the user has seen.
+    if not result.reported:
+        print("  no freshly closed bar on any timeframe; not posting")
+        print("  (if you expected a post, your schedule is firing between bar "
+              "closes — see MAX_BAR_AGE_MINUTES)")
         return 0
 
     if not result.signals and not config.post_when_empty:

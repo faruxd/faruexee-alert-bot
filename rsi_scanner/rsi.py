@@ -106,3 +106,28 @@ def detect_reset(
     if prev > overbought >= curr:
         return BEARISH
     return None
+
+
+DEFAULT_BIAS_MIDLINE = 50.0
+
+
+def bias(rsi_value, midline: float = DEFAULT_BIAS_MIDLINE):
+    """
+    Which side of the midline the higher timeframe sits on.
+
+    Returns BULLISH above, BEARISH below, None exactly on it or when RSI is
+    not yet defined.
+
+    Used to gate 4H resets against the daily. The rule is trade-with-the-trend,
+    matching the HTF filter in faruexee_alert_bot.py: a 4H BULLISH reset is
+    only interesting when the daily is also bullish (buying a dip inside an
+    uptrend), and a 4H BEARISH reset only when the daily is bearish (selling a
+    rally inside a downtrend). A 4H signal fighting the daily is suppressed.
+    """
+    if rsi_value is None:
+        return None
+    if rsi_value > midline:
+        return BULLISH
+    if rsi_value < midline:
+        return BEARISH
+    return None
