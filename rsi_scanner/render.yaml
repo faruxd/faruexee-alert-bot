@@ -1,0 +1,102 @@
+# =============================================================================
+#  rsi_scanner on Render  —  Cron Job
+#
+#  ⚠ THIS FILE IS NOT AUTO-DETECTED BY RENDER, AND THAT IS DELIBERATE.
+#
+#  Render Blueprints read `render.yaml` from the REPOSITORY ROOT ONLY. The root
+#  render.yaml in this repo deploys the LIVE faruexee-trade-bot. Adding this
+#  cron job to that file would put a Blueprint sync in a position to overwrite
+#  dashboard settings on a service that is currently holding real positions.
+#
+#  So this deploys as a MANUAL service, which touches nothing that already
+#  exists -- the same decision, for the same reason, as server/render.yaml.
+#
+#  This file is the REFERENCE for the dashboard settings. Copy them in by hand.
+#
+#  ── Dashboard → New → Cron Job ─────────────────────────────────────────────
+#
+#      Repository       faruxd/faruexee-alert-bot
+#      Branch           main
+#      Root Directory   (leave BLANK -- the module path is rsi_scanner/ from
+#                        the repo root, so a root dir would break the import)
+#      Runtime          Python 3
+#      Build Command    pip install -r rsi_scanner/requirements.txt
+#      Start Command    python -m rsi_scanner
+#      Schedule         10 0 * * *          (UTC, always -- Render ignores
+#                                            your local timezone here)
+#      Instance Type    the smallest available
+#
+#  ── Sizing ──
+#
+#  Measured on the full 29-symbol universe: 18 seconds wall time, 13 MB peak
+#  heap. The scan is almost entirely network wait. The smallest instance Render
+#  offers is already far more than this needs.
+#
+#  ── Cost ──
+#
+#  Cron Jobs are a PAID service type on Render -- there is no free tier for
+#  them, unlike Web Services. Check current pricing in the dashboard before
+#  creating it. The GitHub Actions workflow in .github/workflows/rsi-daily.yml
+#  does the identical job for free; this exists for the case where you want
+#  guaranteed delivery instead of GitHub's best-effort scheduler.
+#
+#  DO NOT run both. Two schedulers means two digests every morning.
+#  Disable the workflow first: Actions tab → "Daily RSI reset scan" → ⋯ →
+#  Disable workflow.
+#
+#  ── Why a Cron Job and not a Worker or Web Service ──
+#
+#  This process runs for 18 seconds and exits. A Background Worker expects a
+#  long-lived process and would restart it in a hot loop. A free Web Service
+#  sleeps after 15 minutes of no HTTP and would miss its own schedule. A Cron
+#  Job is the only shape that matches the workload.
+#
+#  No persistent disk is needed. The scanner keeps no state between runs by
+#  design -- it evaluates each closed bar exactly once, so there is nothing to
+#  remember and nothing to lose on a restart.
+# =============================================================================
+
+# ---- Environment variables to set in the dashboard --------------------------
+#
+#  Secret. Enter in the Render dashboard ONLY, never in git:
+#
+#      DISCORD_RSI_WEBHOOK      https://discord.com/api/webhooks/...
+#
+#  Everything else has a working default; these are set explicitly so the
+#  behaviour is visible in the dashboard rather than implied by code:
+#
+#      DAY_BOUNDARY             utc        (resample 4H -> true UTC days;
+#                                           'exchange' uses Bitget's native 1D
+#                                           bars, which close at 16:00 UTC)
+#      POST_WHEN_EMPTY          false      (stay quiet on a no-signal day)
+#      PYTHON_VERSION           3.12.7
+#
+#  To test without posting, set RSI_DRY_RUN=true, trigger a manual run, read
+#  the logs, then remove it.
+#
+# -----------------------------------------------------------------------------
+#
+#  The block below is a valid Blueprint definition, kept for the case where
+#  rsi_scanner moves to its own repository. In THIS repo it is inert -- Render
+#  never reads a render.yaml outside the root.
+
+services:
+  - type: cron
+    name: rsi-reset-scanner
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "10 0 * * *"
+    buildCommand: pip install -r rsi_scanner/requirements.txt
+    startCommand: python -m rsi_scanner
+
+    envVars:
+      - key: DISCORD_RSI_WEBHOOK
+        sync: false
+      - key: DAY_BOUNDARY
+        value: utc
+      - key: POST_WHEN_EMPTY
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.12.7"

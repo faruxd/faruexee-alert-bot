@@ -1,0 +1,81 @@
+# =============================================================================
+#  Daily RSI reset scan
+#
+#  Runs once per closed UTC daily bar and posts a single Discord digest.
+#  No server, no always-on process, nothing to keep awake.
+#
+#  SETUP (one time):
+#    Repo → Settings → Secrets and variables → Actions → New repository secret
+#      Name:  DISCORD_RSI_WEBHOOK
+#      Value: the webhook URL for your new #rsi-alerts channel
+#
+#  Test it before trusting it:
+#    Actions tab → "Daily RSI reset scan" → Run workflow → dry_run = true
+#  That prints the digest to the run log and posts nothing.
+#
+#  ── On the schedule ────────────────────────────────────────────────────────
+#  00:10 UTC, ten minutes after the 20:00-00:00 4H bar closes, so the day is
+#  genuinely complete before we read it.
+#
+#  GitHub's scheduled runs are best-effort and are routinely late by 5-30
+#  minutes at peak times. That is harmless here BY DESIGN: the scanner decides
+#  which bar is closed by checking the clock, not by assuming it started on
+#  time. A late run reports the same day's result. It is not, however, a
+#  guarantee of delivery -- GitHub can skip runs entirely under load, and
+#  disables schedules on repos with no activity for 60 days. If a missed day
+#  is unacceptable, move this to Render Cron.
+# =============================================================================
+
+name: Daily RSI reset scan
+
+on:
+  schedule:
+    - cron: "10 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the digest without posting to Discord"
+        type: boolean
+        default: true
+      symbols:
+        description: "Comma-separated override (blank = full universe)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rsi-daily
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r rsi_scanner/requirements.txt
+
+      - name: Run tests
+        # The maths is verified against Wilder's reference series on every
+        # run. It costs two seconds and means a broken scan cannot post a
+        # confidently wrong number to your phone.
+        run: python -m pytest rsi_scanner/tests -q
+
+      - name: Scan and post
+        env:
+          DISCORD_RSI_WEBHOOK: ${{ secrets.DISCORD_RSI_WEBHOOK }}
+          RSI_SYMBOLS: ${{ inputs.symbols }}
+          RSI_DRY_RUN: ${{ inputs.dry_run }}
+          DAY_BOUNDARY: utc
+          POST_WHEN_EMPTY: "false"
+        run: python -m rsi_scanner

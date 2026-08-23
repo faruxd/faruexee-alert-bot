@@ -1,0 +1,7 @@
+# The scanner needs exactly one third-party package. Pinned to the version
+# the test suite was run against -- a cron that silently picks up a new minor
+# version is a cron whose HTTP behaviour changed without a diff.
+requests==2.34.2
+
+# Test-only
+pytest==9.1.1
