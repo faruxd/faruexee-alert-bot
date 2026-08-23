@@ -73,8 +73,8 @@ ATR_LEN           = 14     # Fix E — ATR period
 ATR_MULT          = 0.5    # Fix E — ATR SL multiplier
 SL_BUFFER         = 0.1    # Fallback SL buffer × zone height (matches Pine default)
 MIN_RR            = 1.5    # Fix D — reject zones where TP1 < N × SL distance
-FIRE_ON_2ND_TEST  = True   # Fix G — Pine default; fire on 2nd test (1st tap = tested, 2nd = alert)
-REQUIRE_REJECTION = True   # Pine entry signal requires close > zone_top (demand) / close < zone_bot (supply)
+FIRE_ON_2ND_TEST  = False  # Fire immediately on the first tap (not 2nd test)
+REQUIRE_REJECTION = False  # Any wick into the zone counts — no waiting for close back outside
 USE_HTF_FILTER    = True   # Fix F — only alert when HTF trend agrees
 USE_FVG_FILTER    = False  # Pine default — showImb=false; FVG filter off
 
