@@ -71,7 +71,7 @@ USE_BASE_CANDLE   = True   # Fix I — use origin block candle as zone (not impu
 USE_ATR_SL        = True   # Fix E — ATR-based SL (adapts to volatility)
 ATR_LEN           = 14     # Fix E — ATR period
 ATR_MULT          = 0.5    # Fix E — ATR SL multiplier
-SL_BUFFER         = 0.25   # Fallback SL buffer × zone height (only when ATR disabled)
+SL_BUFFER         = 0.1    # Fallback SL buffer × zone height (matches Pine default)
 MIN_RR            = 1.5    # Fix D — reject zones where TP1 < N × SL distance
 FIRE_ON_2ND_TEST  = True   # Fix G — Pine default; fire on 2nd test (1st tap = tested, 2nd = alert)
 REQUIRE_REJECTION = True   # Pine entry signal requires close > zone_top (demand) / close < zone_bot (supply)
@@ -88,9 +88,9 @@ HTF_MAP = {                # Fix F — which HTF to check per scanning timeframe
 TP_MULTI          = 2.0    # TP Fallback multiplier (when no opposing zone found)
 
 # ── SMC CHoCH Confluence Filter ──
-# Only alert zones/taps that align with the current 4H CHoCH direction
-# AND that formed AFTER the CHoCH was established.
-USE_SMC_CHOCH_FILTER = True
+# Disabled by default — bot mirrors the Pine indicator exactly:
+# new zone alerts + tap alerts on Pine's LONG/SHORT ENTRY conditions only.
+USE_SMC_CHOCH_FILTER = False
 SMC_CHOCH_TIMEFRAME  = "4H"    # Timeframe to compute CHoCH state on
 SMC_STRUCT_LOOKBACK  = 10      # Pivot lookback bars (matches Pine Script default)
 SMC_BODY_BREAK       = True    # Use close price for structure break (body candle)
@@ -754,13 +754,15 @@ def run_indicator(candles):
             "created_ts": z["ts"],
         })
 
-    # Dedupe — closed-bar tap and live tap can pick up the same zone in one scan
-    seen         = set()
+    # Fix A: Pine fires an entry signal for only the CLOSEST qualifying zone
+    # per side — highest demand top, lowest supply bot. Reduce to that.
+    demand_cands = [z for z in tapped_cands if z["side"] == "buy"]
+    supply_cands = [z for z in tapped_cands if z["side"] == "sell"]
     tapped_zones = []
-    for z in tapped_cands:
-        if z["zone_id"] not in seen:
-            seen.add(z["zone_id"])
-            tapped_zones.append(z)
+    if demand_cands:
+        tapped_zones.append(max(demand_cands, key=lambda z: z["zone_top"]))
+    if supply_cands:
+        tapped_zones.append(min(supply_cands, key=lambda z: z["zone_bot"]))
 
     # ── Fix B: FVG detection ──
     inside_fvg = detect_inside_fvg(highs, lows, closes, n)
