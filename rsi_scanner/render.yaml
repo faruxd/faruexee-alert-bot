@@ -65,6 +65,10 @@
 #  Everything else has a working default; these are set explicitly so the
 #  behaviour is visible in the dashboard rather than implied by code:
 #
+#      RSI_PERIOD               7          (NOT Wilder's default 14. Set
+#                                          explicitly so the dashboard shows
+#                                          the real value rather than relying
+#                                          on a code default that could drift)
 #      DAY_BOUNDARY             utc        (resample 4H -> true UTC days;
 #                                           'exchange' uses Bitget's native 1D
 #                                           bars, which close at 16:00 UTC)
@@ -94,6 +98,8 @@ services:
     envVars:
       - key: DISCORD_RSI_WEBHOOK
         sync: false
+      - key: RSI_PERIOD
+        value: "7"
       - key: DAY_BOUNDARY
         value: utc
       - key: POST_WHEN_EMPTY

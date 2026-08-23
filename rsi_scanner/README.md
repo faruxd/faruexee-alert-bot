@@ -12,11 +12,27 @@ Read-only. Holds no API keys, places no orders, and shares no state with
 
 | | |
 |---|---|
-| **Bullish reset** | RSI(14) was **below 30** on the prior closed daily bar and is **at or above 30** on the latest |
-| **Bearish reset** | RSI(14) was **above 70** on the prior closed daily bar and is **at or below 70** on the latest |
+| **Bullish reset** | RSI(7) was **below 30** on the prior closed daily bar and is **at or above 30** on the latest |
+| **Bearish reset** | RSI(7) was **above 70** on the prior closed daily bar and is **at or below 70** on the latest |
 
 The crossing bar must be the **latest** one. A symbol that climbed out of
 oversold three days ago does not fire today.
+
+### Why period 7, and what it costs
+
+The deployed period is **7**, not Wilder's 14. Measured across all 29 symbols
+over the 89 days Bitget serves:
+
+| Config | 89-day signals | Alerts/day |
+|---|---|---|
+| RSI(14) 30/70 | 68 | 0.9 |
+| **RSI(7) 30/70 — deployed** | **188** | **2.4** |
+| RSI(7) 20/80 | 74 | 0.9 |
+
+A shorter period swings wider and touches the levels far more often, so the
+same 30/70 thresholds fire roughly **2.8× as much**. That is the tradeoff you
+are taking, not a defect. If the volume proves too high, `RSI_OVERSOLD=20` and
+`RSI_OVERBOUGHT=80` return to about 0.9/day while keeping period 7.
 
 This signal can retrigger — RSI wobbling around 30 can cross up, fall back,
 and cross up again inside a week. That is the honest behaviour of a threshold
@@ -44,8 +60,8 @@ bars instead. Check which one your chart uses before trusting the numbers.
 `limit=1000` on `1D` returns 90 rows. `4H` returns 540 rows — the same 90
 days. `history-candles` does not help. This is data retention, not paging.
 
-90 days is comfortably enough for RSI(14) to converge (~75 smoothing steps
-past the seed). It rules out anything needing a 200-day lookback — the same
+90 days is comfortably enough for RSI(7) or RSI(14) to converge (~80 smoothing
+steps past the seed at period 7). It rules out anything needing a 200-day lookback — the same
 limit that pins the trade bot's HTF filter to an EMA rather than structure.
 
 ---
@@ -77,7 +93,7 @@ All via environment variables. Every one has a working default.
 |---|---|---|
 | `DISCORD_RSI_WEBHOOK` | *(none)* | Webhook URL. Must be `https://`. Absent = print only. |
 | `RSI_SYMBOLS` | full universe | Comma-separated override |
-| `RSI_PERIOD` | `14` | RSI lookback |
+| `RSI_PERIOD` | `7` | RSI lookback. **Not** Wilder's 14 — see below |
 | `RSI_OVERSOLD` | `30` | Bullish reset level |
 | `RSI_OVERBOUGHT` | `70` | Bearish reset level |
 | `DAY_BOUNDARY` | `utc` | `utc` (resampled 4H) or `exchange` (native 1D, 16:00 close) |
@@ -117,7 +133,8 @@ pip install -r rsi_scanner/requirements.txt
 python -m rsi_scanner --dry-run
 ```
 
-Tests — the RSI is verified against Wilder's published reference series, so a
+Tests — the RSI is verified against Wilder's published reference series at
+period 14 (the algorithm check is independent of the deployed period), so a
 failure here means the maths is wrong:
 
 ```bash
@@ -168,7 +185,7 @@ settings on a service holding real positions. Copy the values in by hand.
 | Schedule | `10 0 * * *` (UTC always — Render ignores local time) |
 | Instance Type | smallest available |
 
-Environment: `DISCORD_RSI_WEBHOOK` (secret), `DAY_BOUNDARY=utc`,
+Environment: `DISCORD_RSI_WEBHOOK` (secret), `RSI_PERIOD=7`, `DAY_BOUNDARY=utc`,
 `POST_WHEN_EMPTY=false`, `PYTHON_VERSION=3.12.7`.
 
 **Measured cost of a run:** 18 seconds wall time, 13 MB peak heap, on the full

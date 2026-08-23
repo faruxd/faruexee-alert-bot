@@ -106,3 +106,37 @@ def test_none_values_are_not_a_signal():
 def test_custom_thresholds_are_honoured():
     assert detect_reset([19.0, 21.0], oversold=20.0, overbought=80.0) == BULLISH
     assert detect_reset([19.0, 21.0]) is None   # default 30 -> no cross
+
+
+def test_default_period_is_7_not_wilders_14():
+    """
+    Locked deliberately. The deployed setting is 7; if someone "corrects" this
+    back to the textbook 14, every threshold crossing changes and the alert
+    rate drops by roughly two thirds without anything looking broken.
+    """
+    from rsi_scanner.rsi import DEFAULT_PERIOD
+    assert DEFAULT_PERIOD == 7
+
+
+def test_reference_test_pins_its_own_period():
+    """
+    The Wilder check above must pass 14 explicitly rather than relying on the
+    default -- it validates the algorithm, not the deployed configuration.
+    Changing DEFAULT_PERIOD must never silently invalidate the reference.
+    """
+    import inspect
+    from rsi_scanner.tests import test_rsi
+    assert "wilder_rsi(WILDER_CLOSES, 14)" in inspect.getsource(
+        test_rsi.test_matches_wilder_reference
+    )
+
+
+def test_shorter_period_swings_wider():
+    """
+    The reason the alert rate roughly triples: RSI(7) reaches further from 50
+    than RSI(14) on the same data.
+    """
+    closes = WILDER_CLOSES
+    r7 = [v for v in wilder_rsi(closes, 7) if v is not None]
+    r14 = [v for v in wilder_rsi(closes, 14) if v is not None]
+    assert max(abs(v - 50) for v in r7) > max(abs(v - 50) for v in r14)

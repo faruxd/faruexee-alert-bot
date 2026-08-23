@@ -77,5 +77,6 @@ jobs:
           RSI_SYMBOLS: ${{ inputs.symbols }}
           RSI_DRY_RUN: ${{ inputs.dry_run }}
           DAY_BOUNDARY: utc
+          RSI_PERIOD: "7"
           POST_WHEN_EMPTY: "false"
         run: python -m rsi_scanner
