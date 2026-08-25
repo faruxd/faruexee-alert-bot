@@ -4,12 +4,17 @@ Scan orchestration.
 Two timeframes with different rules:
 
   1D  reported on its own merits.
-  4H  reported ONLY when it agrees with the daily bias. A 4H bullish reset
-      inside a bullish daily is a dip being bought in an uptrend; the same
-      reset inside a bearish daily is a bounce in a downtrend, and firing on
-      it is how you end up long into a falling market. Measured over 90 days,
-      unfiltered 4H produces ~13.6 alerts a day across this universe, which
-      is a channel nobody reads.
+  4H  reported either way, but SPLIT by whether it agrees with the daily
+      bias. A 4H bullish reset inside a bullish daily is a dip being bought
+      in an uptrend; the same reset inside a bearish daily is a bounce in a
+      downtrend, and acting on it is how you end up long into a falling
+      market. Both are shown -- the agreeing ones prominently, the rest
+      compactly -- so the distinction stays visible instead of being decided
+      for the reader.
+
+      Volume is the cost: measured over 80 days across this universe, 4H
+      resets run ~17.6/day unfiltered against ~2.1/day for the agreeing
+      subset. Set ALERT_4H_UNCONFIRMED=false to go back to agreeing-only.
 
 The daily series is fetched on EVERY run regardless of timeframe, because the
 4H filter needs it. That is 2 requests per symbol per run, not 1.
@@ -44,6 +49,10 @@ class Signal:
     bar_ts_ms: int
     is_crypto: bool
     daily_rsi: Optional[float] = None   # context; set on 4H signals
+    # 4H only. True when the reset agrees with the daily bias, False when it
+    # fights it. 1D signals are always True -- there is no higher timeframe
+    # for them to agree with.
+    daily_confirmed: bool = True
 
     @property
     def pct_change(self) -> float:
@@ -80,6 +89,14 @@ class ScanResult:
 
     def for_tf(self, timeframe: str) -> List[Signal]:
         return [s for s in self.signals if s.timeframe == timeframe]
+
+    def confirmed_4h(self) -> List[Signal]:
+        return [s for s in self.signals
+                if s.timeframe == "4H" and s.daily_confirmed]
+
+    def unconfirmed_4h(self) -> List[Signal]:
+        return [s for s in self.signals
+                if s.timeframe == "4H" and not s.daily_confirmed]
 
 
 def scan(config: Config, now_ms: Optional[int] = None, log=print) -> ScanResult:
@@ -143,15 +160,19 @@ def _scan_symbol(symbol, config, result, session, now_ms, log) -> None:
 
             if _is_fresh(h4_bars[-1][0], "4H", config, result, now_ms):
                 direction = detect_reset(h4_series, config.oversold, config.overbought)
-                if direction and direction == daily_bias:
-                    line += f"   *** 4H {direction.upper()} (1D agrees) ***"
-                    sig = _mk(symbol, direction, "4H", h4_series, h4_closes,
-                              h4_bars, is_crypto)
-                    sig.daily_rsi = float(daily_rsi) if daily_rsi is not None else None
-                    result.signals.append(sig)
-                elif direction:
-                    result.suppressed += 1
-                    line += f"   (4H {direction} suppressed: 1D is {daily_bias})"
+                if direction:
+                    confirmed = direction == daily_bias
+                    if confirmed or config.alert_4h_unconfirmed:
+                        tag = "1D agrees" if confirmed else f"against 1D {daily_bias}"
+                        line += f"   *** 4H {direction.upper()} ({tag}) ***"
+                        sig = _mk(symbol, direction, "4H", h4_series, h4_closes,
+                                  h4_bars, is_crypto)
+                        sig.daily_rsi = float(daily_rsi) if daily_rsi is not None else None
+                        sig.daily_confirmed = confirmed
+                        result.signals.append(sig)
+                    else:
+                        result.suppressed += 1
+                        line += f"   (4H {direction} suppressed: 1D is {daily_bias})"
 
     log(line)
 

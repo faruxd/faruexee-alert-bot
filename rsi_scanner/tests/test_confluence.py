@@ -70,40 +70,55 @@ FRESH = DAY0 + MS_PER_DAY + 600_000          # 10 min after both bars closed
 def test_4h_bullish_fires_when_daily_is_also_bullish(wiring):
     """Daily above the midline, 4H crossing up out of oversold. Buy the dip."""
     result = wiring(daily_series=pad(60.0, 62.0), h4_series=pad(26.0, 33.0), now_ms=FRESH)
-    h4 = result.for_tf("4H")
+    h4 = result.confirmed_4h()
     assert len(h4) == 1 and h4[0].direction == "bullish"
-    assert result.suppressed == 0
+    assert h4[0].daily_confirmed is True
+    assert result.unconfirmed_4h() == []
 
 
-def test_4h_bullish_is_suppressed_when_daily_is_bearish(wiring):
-    """A bounce inside a downtrend. This is the alert the filter exists to kill."""
+def test_4h_bullish_against_a_bearish_daily_is_reported_but_flagged(wiring):
+    """
+    A bounce inside a downtrend. Still reported -- the user asked to see these
+    -- but it must land in the counter-trend bucket, not alongside the ones
+    that passed the filter.
+    """
     result = wiring(daily_series=pad(40.0, 38.0), h4_series=pad(26.0, 33.0), now_ms=FRESH)
-    assert result.for_tf("4H") == []
-    assert result.suppressed == 1
+    assert result.confirmed_4h() == []
+    assert len(result.unconfirmed_4h()) == 1
+    assert result.unconfirmed_4h()[0].daily_confirmed is False
+    assert result.suppressed == 0
 
 
 def test_4h_bearish_fires_when_daily_is_also_bearish(wiring):
     result = wiring(daily_series=pad(40.0, 38.0), h4_series=pad(74.0, 68.0), now_ms=FRESH)
-    h4 = result.for_tf("4H")
+    h4 = result.confirmed_4h()
     assert len(h4) == 1 and h4[0].direction == "bearish"
 
 
-def test_4h_bearish_is_suppressed_when_daily_is_bullish(wiring):
+def test_4h_bearish_against_a_bullish_daily_is_reported_but_flagged(wiring):
     result = wiring(daily_series=pad(60.0, 62.0), h4_series=pad(74.0, 68.0), now_ms=FRESH)
+    assert result.confirmed_4h() == []
+    assert len(result.unconfirmed_4h()) == 1
+
+
+def test_turning_the_toggle_off_restores_suppression(wiring):
+    """ALERT_4H_UNCONFIRMED=false goes back to agreeing-only, ~5 alerts/day."""
+    result = wiring(daily_series=pad(40.0, 38.0), h4_series=pad(26.0, 33.0),
+                    now_ms=FRESH, alert_4h_unconfirmed=False)
     assert result.for_tf("4H") == []
     assert result.suppressed == 1
 
 
-def test_daily_exactly_on_the_midline_suppresses_everything(wiring):
-    """No bias either way, so nothing to agree with."""
+def test_daily_exactly_on_the_midline_confirms_nothing(wiring):
+    """No bias either way, so there is nothing for a 4H reset to agree with."""
     result = wiring(daily_series=pad(50.0, 50.0), h4_series=pad(26.0, 33.0), now_ms=FRESH)
-    assert result.for_tf("4H") == []
-    assert result.suppressed == 1
+    assert result.confirmed_4h() == []
+    assert len(result.unconfirmed_4h()) == 1
 
 
 def test_4h_signal_carries_the_daily_rsi_for_context(wiring):
     result = wiring(daily_series=pad(60.0, 63.5), h4_series=pad(26.0, 33.0), now_ms=FRESH)
-    assert result.for_tf("4H")[0].daily_rsi == pytest.approx(63.5)
+    assert result.confirmed_4h()[0].daily_rsi == pytest.approx(63.5)
 
 
 def test_daily_signal_is_not_gated_by_anything(wiring):
@@ -115,8 +130,8 @@ def test_daily_signal_is_not_gated_by_anything(wiring):
 def test_custom_midline_moves_the_gate(wiring):
     """Daily 55 is bullish at midline 50, bearish at midline 60."""
     kw = dict(daily_series=pad(55.0, 55.0), h4_series=pad(26.0, 33.0), now_ms=FRESH)
-    assert len(wiring(**kw, bias_midline=50.0).for_tf("4H")) == 1
-    assert wiring(**kw, bias_midline=60.0).for_tf("4H") == []
+    assert len(wiring(**kw, bias_midline=50.0).confirmed_4h()) == 1
+    assert wiring(**kw, bias_midline=60.0).confirmed_4h() == []
 
 
 # --------------------------------------------------------------------------

@@ -83,5 +83,6 @@ jobs:
           RSI_DRY_RUN: ${{ inputs.dry_run }}
           DAY_BOUNDARY: utc
           RSI_PERIOD: "7"
+          ALERT_4H_UNCONFIRMED: "true"
           POST_WHEN_EMPTY: "false"
         run: python -m rsi_scanner

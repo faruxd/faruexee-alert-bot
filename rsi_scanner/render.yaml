@@ -86,8 +86,12 @@
 #                                          reliable, so 30 is also fine here;
 #                                          keep it loose on GitHub Actions,
 #                                          whose runs are often 30 min late)
-#      BIAS_MIDLINE             50         (4H resets fire only when the
-#                                          daily RSI is on the same side)
+#      BIAS_MIDLINE             50         (which side the daily must be on
+#                                          for a 4H reset to count as agreeing)
+#      ALERT_4H_UNCONFIRMED     true       (also report 4H resets that FIGHT
+#                                          the daily, in a compact section.
+#                                          This is ~20 alerts/day total.
+#                                          false cuts it to ~5/day)
 #      DAY_BOUNDARY             utc        (resample 4H -> true UTC days;
 #                                           'exchange' uses Bitget's native 1D
 #                                           bars, which close at 16:00 UTC)

@@ -18,7 +18,7 @@ import datetime as dt
 import sys
 
 from .config import Config
-from .notify import build_digest, post
+from .notify import build_digest, build_messages, post_all
 from .scan import scan
 
 
@@ -42,7 +42,8 @@ def main(argv=None) -> int:
     print(
         f"  symbols={len(config.symbols)}  RSI({config.period})  "
         f"levels={config.oversold:g}/{config.overbought:g}  "
-        f"tf={','.join(config.timeframes)}  bias>{config.bias_midline:g}  "
+        f"tf={','.join(config.timeframes)}  bias>{config.bias_midline:g}"
+        f"{'+unconfirmed4H' if config.alert_4h_unconfirmed else ''}  "
         f"day={config.day_boundary}  max_bar_age={config.max_bar_age_minutes:g}m  "
         f"webhook={'yes' if config.webhook_url else 'NO'}"
         + ("  [DRY RUN]" if config.dry_run else "")
@@ -96,7 +97,18 @@ def main(argv=None) -> int:
         print("  no signals; not posting (set POST_WHEN_EMPTY=true to post anyway)")
         return 0
 
-    print("  posted to Discord" if post(config.webhook_url, message) else "  post did not succeed")
+    messages = build_messages(
+        result,
+        boundary=config.day_boundary,
+        oversold=config.oversold,
+        overbought=config.overbought,
+    )
+    if len(messages) > 1:
+        print(f"  digest split into {len(messages)} messages")
+    if post_all(config.webhook_url, messages):
+        print(f"  posted to Discord ({len(messages)} message(s))")
+    else:
+        print("  post did not succeed")
     return 0
 
 

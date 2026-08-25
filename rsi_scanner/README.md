@@ -18,29 +18,36 @@ Read-only. Holds no API keys, places no orders, shares no state with
 The crossing bar must be the **latest** one. A symbol that climbed out of
 oversold three bars ago does not fire now.
 
-### 1D stands alone. 4H must agree with the daily.
+### 1D stands alone. 4H is split by whether the daily agrees.
 
-A 4H reset only alerts when the **daily RSI is on the same side of 50**:
+Every 4H reset is reported. They are separated by whether the **daily RSI is
+on the same side of 50**:
 
-- Daily RSI **above 50** → bullish regime → 4H **bullish** resets fire, bearish suppressed
-- Daily RSI **below 50** → bearish regime → 4H **bearish** resets fire, bullish suppressed
-- Daily RSI exactly 50 → no bias, everything suppressed
+- Daily RSI **above 50** → bullish regime → 4H **bullish** resets *agree*, bearish ones are counter-trend
+- Daily RSI **below 50** → bearish regime → 4H **bearish** resets *agree*, bullish ones are counter-trend
+- Daily RSI exactly 50 → no bias, so nothing can agree; all 4H resets are counter-trend
 
-That is buying dips inside an uptrend and selling rallies inside a downtrend —
-the same trade-with-the-higher-timeframe rule as the HTF filter in
-`faruexee_alert_bot.py`. Flip it with `BIAS_MIDLINE`.
+Agreeing signals mean buying dips inside an uptrend and selling rallies inside
+a downtrend — the same trade-with-the-higher-timeframe rule as the HTF filter
+in `faruexee_alert_bot.py`. Flip the sense with `BIAS_MIDLINE`.
 
-This filter is not cosmetic. Measured over 80 days across all 34 symbols:
+The digest renders the two groups **unequally on purpose**: agreeing signals
+get a full line each, counter-trend ones are packed several to a row. There
+are roughly seven times as many of the latter, and giving them equal space
+would push the filtered signals off the bottom of the message.
+
+Measured over 80 days across all 34 symbols:
 
 | | Signals | Alerts/day |
 |---|---|---|
 | 1D resets | 229 | 2.9 |
-| 4H resets, **unfiltered** | 1,404 | 17.6 |
-| 4H resets, **daily-confirmed** | 171 | 2.1 |
-| **Combined, as shipped** | **400** | **5.0** |
+| 4H, **daily agrees** | 171 | 2.1 |
+| 4H, **against the daily** | 1,233 | 15.5 |
+| **Combined, as shipped** | **1,633** | **20.5** |
 
-**The daily filter removes 88% of 4H alerts.** Without it the channel gets
-~20 notifications a day and stops being read.
+**About 20 alerts a day.** That is the deliberate setting. Set
+`ALERT_4H_UNCONFIRMED=false` to drop the counter-trend group and return to
+~5.0/day, which is what the agreeing-only build produced.
 
 ### What this signal is not
 
@@ -106,7 +113,8 @@ All via environment variables. Every one has a working default.
 | `RSI_OVERSOLD` | `30` | Bullish reset level |
 | `RSI_OVERBOUGHT` | `70` | Bearish reset level |
 | `RSI_TIMEFRAMES` | `1D,4H` | `1D` alone is valid; `1D` cannot be removed |
-| `BIAS_MIDLINE` | `50` | Which side of this the daily must be on for a 4H signal |
+| `BIAS_MIDLINE` | `50` | Which side of this the daily must be on for a 4H signal to count as agreeing |
+| `ALERT_4H_UNCONFIRMED` | `true` | Report 4H resets that fight the daily. `false` cuts ~20/day to ~5/day |
 | `MAX_BAR_AGE_MINUTES` | `90` | Older than this = a re-read, post nothing |
 | `DAY_BOUNDARY` | `utc` | `utc` (resampled 4H) or `exchange` (native 1D) |
 | `POST_WHEN_EMPTY` | `false` | Post even with zero signals |
@@ -199,6 +207,10 @@ its own schedule.
 the same instant and crypto is correlated, so a market-wide reset produces a
 dozen-plus hits at once. Separate posts would trip Discord's rate limit,
 arrive out of order, and be unreadable on a phone.
+
+**A digest too long for one Discord message is split, never truncated**, and
+the parts are numbered. Truncating would silently drop the tail — which is
+exactly where the counter-trend 4H section sits.
 
 **A timeframe with no fresh bar is omitted from the digest**, not rendered
 empty. On a 04:00 run only 4H is news, and a "Daily" header there would imply

@@ -10,7 +10,7 @@ notation, the scanner has failed at its job even with perfect maths.
 import pytest
 
 from rsi_scanner.config import Config
-from rsi_scanner.notify import _fmt_price, build_digest
+from rsi_scanner.notify import _fmt_price, build_digest, build_messages
 from rsi_scanner.scan import ScanResult, Signal
 
 WEBHOOK = "https://discord.com/api/webhooks/1/abc"
@@ -178,12 +178,34 @@ def test_non_crypto_symbols_are_tagged():
     assert "⧉" in text and "non-crypto" in text
 
 
-def test_digest_stays_under_the_discord_limit_on_a_full_house():
+def test_a_full_house_is_split_across_messages_not_truncated():
+    """
+    Three tiers on a big reset day runs past 2000 characters. Cutting the tail
+    would silently drop the counter-trend section; splitting keeps everything.
+    """
     signals = [sig(f"SYM{i:02d}USDT", "bullish" if i % 2 else "bearish", 26.0, 31.0,
-                   tf="1D" if i % 2 else "4H")
-               for i in range(40)]
-    text = build_digest(res(signals, reported=["1D", "4H"]))
-    assert len(text) <= 1900
+                   tf="1D" if i % 3 else "4H")
+               for i in range(60)]
+    result = res(signals, reported=["1D", "4H"])
+    messages = build_messages(result)
+    assert all(len(m) <= 1900 for m in messages)
+    # Nothing lost: every symbol still appears somewhere.
+    joined = chr(10).join(messages)
+    for i in range(60):
+        assert f"SYM{i:02d}" in joined
+
+
+def test_split_messages_are_numbered():
+    signals = [sig(f"SYM{i:02d}USDT", "bearish", 78.0, 65.0) for i in range(60)]
+    messages = build_messages(res(signals, reported=["1D"]))
+    assert len(messages) > 1
+    assert "(1/" in messages[0]
+
+
+def test_a_short_digest_is_a_single_unnumbered_message():
+    messages = build_messages(res([sig("BTCUSDT", "bullish", 26.0, 33.0)]))
+    assert len(messages) == 1
+    assert "(1/" not in messages[0]
 
 
 def test_crypto_sorts_above_non_crypto():
