@@ -44,6 +44,7 @@ def main(argv=None) -> int:
         f"levels={config.oversold:g}/{config.overbought:g}  "
         f"tf={','.join(config.timeframes)}  bias>{config.bias_midline:g}"
         f"{'+unconfirmed4H' if config.alert_4h_unconfirmed else ''}  "
+        f"filters={'on' if config.filters_enabled else 'OFF'}  "
         f"day={config.day_boundary}  max_bar_age={config.max_bar_age_minutes:g}m  "
         f"webhook={'yes' if config.webhook_url else 'NO'}"
         + ("  [DRY RUN]" if config.dry_run else "")
@@ -56,7 +57,7 @@ def main(argv=None) -> int:
     print(
         f"  scanned={result.scanned}  bullish={len(result.bullish)}  "
         f"bearish={len(result.bearish)}  suppressed={result.suppressed}  "
-        f"failed={len(result.failures)}"
+        f"filtered={result.filtered}  failed={len(result.failures)}"
     )
     print(f"  fresh timeframes: {result.reported or 'NONE'}")
     for tf, age in sorted(result.stale.items()):

@@ -88,10 +88,16 @@
 #                                          whose runs are often 30 min late)
 #      BIAS_MIDLINE             50         (which side the daily must be on
 #                                          for a 4H reset to count as agreeing)
-#      ALERT_4H_UNCONFIRMED     true       (also report 4H resets that FIGHT
-#                                          the daily, in a compact section.
-#                                          This is ~20 alerts/day total.
-#                                          false cuts it to ~5/day)
+#      ALERT_4H_UNCONFIRMED     false      (code default since 2026-10-23:
+#                                          only 4H resets that AGREE with the
+#                                          daily are sent. true adds the
+#                                          counter-trend ones back. If the
+#                                          dashboard still says true, change
+#                                          it -- the dashboard wins)
+#      RSI_FILTERS              true       (trade filters on every alert:
+#                                          200-day EMA trend, BTC 50-day EMA
+#                                          for alts, funding crowding.
+#                                          Blocked resets are hidden)
 #      DAY_BOUNDARY             utc        (resample 4H -> true UTC days;
 #                                           'exchange' uses Bitget's native 1D
 #                                           bars, which close at 16:00 UTC)

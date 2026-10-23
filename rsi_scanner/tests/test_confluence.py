@@ -48,9 +48,16 @@ def wiring(monkeypatch):
         cfg = Config.from_env({})
         cfg.symbols = list(symbols)
         cfg.request_delay_seconds = 0.0
+        # These tests are about the 4H/1D gate and the duplicate guard; the
+        # trade filters (network-backed) have their own tests in test_filters.
+        cfg.filters_enabled = False
+        # The split-reporting tests below need counter-trend 4H resets
+        # reported; the shipped default (False) is pinned in test_config.
+        cfg.alert_4h_unconfirmed = True
+        filters = cfg_kw.pop("filters", None)
         for k, v in cfg_kw.items():
             setattr(cfg, k, v)
-        return scan_mod.scan(cfg, now_ms=now_ms, log=lambda *a: None)
+        return scan_mod.scan(cfg, now_ms=now_ms, log=lambda *a: None, filters=filters)
 
     return setup
 
@@ -194,3 +201,69 @@ def test_digest_dates_from_the_reported_bar_not_the_daily(wiring):
                     now_ms=now, h4_ts=h4_ts)
     assert result.reported_bar_ts_ms == h4_ts
     assert result.reported_bar_ts_ms != result.last_bar_ts_ms
+
+
+# --------------------------------------------------------------------------
+# Trade filters wiring (the filter decisions themselves: test_filters.py)
+# --------------------------------------------------------------------------
+
+from rsi_scanner.filters import SOURCE_BITGET, Verdict  # noqa: E402
+
+
+class StubFilters:
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.calls = []
+
+    def check(self, symbol, direction, is_crypto):
+        self.calls.append((symbol, direction))
+        return self.verdict
+
+
+def test_a_daily_reset_the_filters_block_is_hidden_and_counted(wiring):
+    stub = StubFilters(Verdict(passed=False, blocked_by=["below EMA200"]))
+    result = wiring(daily_series=pad(26.0, 33.0), h4_series=pad(50.0, 50.0),
+                    now_ms=FRESH, filters=stub)
+    assert result.for_tf("1D") == []
+    assert result.filtered == 1
+    assert stub.calls == [("BTCUSDT", "bullish")]
+
+
+def test_a_daily_reset_that_passes_is_reported(wiring):
+    result = wiring(daily_series=pad(26.0, 33.0), h4_series=pad(50.0, 50.0),
+                    now_ms=FRESH, filters=StubFilters(Verdict(passed=True)))
+    assert len(result.for_tf("1D")) == 1
+    assert result.filtered == 0
+
+
+def test_an_unverifiable_reset_is_reported_and_marked(wiring):
+    stub = StubFilters(Verdict(passed=None, unavailable=["trend", "funding"]))
+    result = wiring(daily_series=pad(26.0, 33.0), h4_series=pad(50.0, 50.0),
+                    now_ms=FRESH, filters=stub)
+    sig = result.for_tf("1D")[0]
+    assert sig.unverified == "trend, funding"
+
+
+def test_a_confirmed_4h_reset_is_filtered_too(wiring):
+    stub = StubFilters(Verdict(passed=False, blocked_by=["funding crowded long"]))
+    result = wiring(daily_series=pad(60.0, 62.0), h4_series=pad(26.0, 33.0),
+                    now_ms=FRESH, filters=stub)
+    assert result.confirmed_4h() == []
+    assert result.filtered == 1
+
+
+def test_4h_against_the_daily_is_suppressed_before_the_filters_are_asked(wiring):
+    """Toggle off: the daily gate rejects it first; no data is fetched for it."""
+    stub = StubFilters(Verdict(passed=True))
+    result = wiring(daily_series=pad(40.0, 38.0), h4_series=pad(26.0, 33.0),
+                    now_ms=FRESH, alert_4h_unconfirmed=False, filters=stub)
+    assert result.for_tf("4H") == []
+    assert result.suppressed == 1
+    assert stub.calls == []
+
+
+def test_bitget_funding_fallback_is_flagged_on_the_result(wiring):
+    stub = StubFilters(Verdict(passed=True, funding_source=SOURCE_BITGET))
+    result = wiring(daily_series=pad(26.0, 33.0), h4_series=pad(50.0, 50.0),
+                    now_ms=FRESH, filters=stub)
+    assert result.funding_fallback is True

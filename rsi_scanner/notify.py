@@ -83,6 +83,8 @@ def _signal_line(sig: Signal) -> str:
     )
     if sig.timeframe == "4H" and sig.daily_rsi is not None:
         line += f"  · 1D `{sig.daily_rsi:.0f}`"
+    if sig.unverified:
+        line += f"  ⚠ _unfiltered: no {sig.unverified} data_"
     return line
 
 
@@ -185,6 +187,11 @@ def _build_lines(result: ScanResult, boundary: str, bar_ts_ms: Optional[int],
     footer = f"_Scanned {result.scanned} symbols_"
     if result.suppressed:
         footer += f"  ·  _{result.suppressed} 4H suppressed_"
+    if result.filtered:
+        footer += f"  ·  _{result.filtered} filtered_"
+    if result.funding_fallback:
+        footer += ("\n_⚠ some funding checked against Bitget's last ~90 days "
+                   "(coin not on Binance, or Binance unreachable)_")
     if result.failures:
         names = ", ".join(display_name(s) for s, _ in result.failures[:5])
         more = f" +{len(result.failures) - 5}" if len(result.failures) > 5 else ""

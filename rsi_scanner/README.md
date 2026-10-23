@@ -1,7 +1,9 @@
 # RSI Reset Scanner
 
 Scans 34 symbols on **1D and 4H** and posts **one Discord digest per run**
-naming every symbol whose RSI(7) crossed back out of an extreme.
+naming every symbol whose RSI(7) crossed back out of an extreme **and** passes
+the trade filters (200-day EMA trend, BTC 50-day EMA for altcoins, funding
+crowding — see [Trade filters](#trade-filters)).
 
 Read-only. Holds no API keys, places no orders, shares no state with
 `faruexee_trade_bot.py` or `cf_bot`. It cannot affect a live position.
@@ -45,9 +47,10 @@ Measured over 80 days across all 34 symbols:
 | 4H, **against the daily** | 1,233 | 15.5 |
 | **Combined, as shipped** | **1,633** | **20.5** |
 
-**About 20 alerts a day.** That is the deliberate setting. Set
-`ALERT_4H_UNCONFIRMED=false` to drop the counter-trend group and return to
-~5.0/day, which is what the agreeing-only build produced.
+Those counts are **before** the trade filters. The shipped workflow now sets
+`ALERT_4H_UNCONFIRMED=false` (4H only when the daily agrees) and runs the trade
+filters on everything, so expect well under the ~5/day of the agreeing-only
+row. Set `ALERT_4H_UNCONFIRMED=true` to get the counter-trend group back.
 
 ### What this signal is not
 
@@ -60,6 +63,41 @@ Treat it as a watchlist filter, not an entry.
 Period is **7**, not Wilder's 14. Shorter swings wider and touches the levels
 more often — at 30/70 that is roughly 2.8x the alert rate of RSI(14). If it
 proves too noisy, `RSI_OVERSOLD=20` / `RSI_OVERBOUGHT=80` cuts it back.
+
+---
+
+## Trade filters
+
+Every reset — 1D, and 4H after the daily check — must also pass all three
+(`filters.py`). These are the filters that survived the backtests in
+`server/research/rsi_reset_filter_backtest.py`.
+
+| Filter | Long reset needs | Short reset needs |
+|---|---|---|
+| **Trend** | last completed daily close **above** the coin's 200-day EMA | **below** it |
+| **BTC** (altcoins only) | BTC's last daily close **above** its 50-day EMA | **below** it |
+| **Funding** | last-7-day funding **not** above the 90th percentile of its past year | **not** below the 10th percentile |
+
+A reset the filters **block is not shown at all**; the footer only counts it
+(`· 3 filtered`), so a filter that has broken and blocks everything is still
+visible. A reset the filters **cannot check** is shown, marked
+`⚠ unfiltered: no … data` — dropping it silently would make a broken data
+source look like a quiet market.
+
+**Data comes from Binance**, because Bitget keeps only ~90 days and a 200-day
+EMA and a one-year funding comparison need more. Daily candles: Binance's public
+market-data mirror (`data-api.binance.vision`). Funding: Binance futures; where
+that is unavailable (CRO isn't listed there; the main Binance API also refuses
+some regions, US-hosted CI runners possibly among them) it falls back to
+Bitget's ~90 days and the footer says so. CRO and the four non-crypto symbols
+have no Binance candles, so their trend check cannot run and they arrive
+marked. Data is fetched only for symbols that actually reset.
+
+**What the backtests say, plainly:** with these filters the daily signal was
+about breakeven on coins it was not tuned on (0 to +0.05R per trade), and 4H
+resets that agree with the daily lost money (−0.08R per trade). The filters
+make the list shorter and better aligned; they do not turn it into an entry
+signal.
 
 ---
 
@@ -114,7 +152,8 @@ All via environment variables. Every one has a working default.
 | `RSI_OVERBOUGHT` | `70` | Bearish reset level |
 | `RSI_TIMEFRAMES` | `1D,4H` | `1D` alone is valid; `1D` cannot be removed |
 | `BIAS_MIDLINE` | `50` | Which side of this the daily must be on for a 4H signal to count as agreeing |
-| `ALERT_4H_UNCONFIRMED` | `true` | Report 4H resets that fight the daily. `false` cuts ~20/day to ~5/day |
+| `ALERT_4H_UNCONFIRMED` | `false` | `true` also reports 4H resets that fight the daily, in a compact section |
+| `RSI_FILTERS` | `true` | Trade filters (trend, BTC, funding). `false` reports every reset again |
 | `MAX_BAR_AGE_MINUTES` | `90` | Older than this = a re-read, post nothing |
 | `DAY_BOUNDARY` | `utc` | `utc` (resampled 4H) or `exchange` (native 1D) |
 | `POST_WHEN_EMPTY` | `false` | Post even with zero signals |

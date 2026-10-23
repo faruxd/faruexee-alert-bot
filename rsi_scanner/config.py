@@ -33,9 +33,14 @@ class Config:
     timeframes: List[str] = field(default_factory=lambda: ["1D", "4H"])
     bias_midline: float = DEFAULT_BIAS_MIDLINE
     # Report 4H resets that FIGHT the daily bias, in their own compact
-    # section. On by default. Turning it off roughly cuts total volume from
-    # ~20 alerts/day to ~5 -- see the README table before changing it.
-    alert_4h_unconfirmed: bool = True
+    # section. OFF by default since 2026-10-23: the user wants only 4H resets
+    # that agree with the daily, and the scanner runs as a Render Cron Job
+    # whose env comes from the dashboard, so the default is what applies
+    # unless the dashboard overrides it.
+    alert_4h_unconfirmed: bool = False
+    # Trade filters (filters.py): 200-day EMA trend, BTC 50-day EMA for alts,
+    # funding crowding. Blocked resets are hidden. On by default.
+    filters_enabled: bool = True
     # A bar older than this is a re-read, not news. See scan._is_fresh.
     max_bar_age_minutes: float = 90.0
     post_when_empty: bool = False
@@ -101,7 +106,8 @@ class Config:
             day_boundary=boundary,
             timeframes=timeframes,
             bias_midline=midline,
-            alert_4h_unconfirmed=_flag(env.get("ALERT_4H_UNCONFIRMED"), default=True),
+            alert_4h_unconfirmed=_flag(env.get("ALERT_4H_UNCONFIRMED"), default=False),
+            filters_enabled=_flag(env.get("RSI_FILTERS"), default=True),
             max_bar_age_minutes=max_age,
             post_when_empty=_flag(env.get("POST_WHEN_EMPTY")),
             dry_run=_flag(env.get("RSI_DRY_RUN")),

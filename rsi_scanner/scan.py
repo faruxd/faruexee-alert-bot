@@ -19,6 +19,12 @@ Two timeframes with different rules:
 The daily series is fetched on EVERY run regardless of timeframe, because the
 4H filter needs it. That is 2 requests per symbol per run, not 1.
 
+Every reset that gets this far then has to pass the trade filters in
+filters.py (200-day EMA trend, BTC 50-day EMA for altcoins, funding
+crowding). A reset the filters block is not reported at all -- only counted.
+One the filters cannot check is reported and marked unverified. Data for
+the filters is fetched only for symbols that actually reset.
+
 A symbol that fails to fetch is recorded and skipped -- one delisted or flaky
 name must never cost you the other thirty-three.
 """
@@ -33,6 +39,7 @@ import requests
 
 from .bitget import FetchError, bar_age_minutes, bars_for
 from .config import Config
+from .filters import SOURCE_BITGET, FilterContext
 from .rsi import bias, detect_reset, wilder_rsi
 from .symbols import NON_CRYPTO
 
@@ -53,6 +60,9 @@ class Signal:
     # fights it. 1D signals are always True -- there is no higher timeframe
     # for them to agree with.
     daily_confirmed: bool = True
+    # Set when a trade filter could not run (no data for this symbol). The
+    # alert is still sent, marked, rather than dropped silently.
+    unverified: Optional[str] = None
 
     @property
     def pct_change(self) -> float:
@@ -71,6 +81,11 @@ class ScanResult:
     # 4H resets rejected because they fought the daily. Surfaced so a silent
     # filter cannot quietly swallow everything without anyone noticing.
     suppressed: int = 0
+    # Resets blocked by the trade filters. Hidden from the digest, but counted
+    # in its footer so a filter that blocks everything is still noticeable.
+    filtered: int = 0
+    # True if any funding check fell back to Bitget's 90 days.
+    funding_fallback: bool = False
     # Which timeframes actually had a freshly closed bar this run.
     reported: List[str] = field(default_factory=list)
     stale: Dict[str, float] = field(default_factory=dict)
@@ -99,16 +114,19 @@ class ScanResult:
                 if s.timeframe == "4H" and not s.daily_confirmed]
 
 
-def scan(config: Config, now_ms: Optional[int] = None, log=print) -> ScanResult:
+def scan(config: Config, now_ms: Optional[int] = None, log=print,
+         filters: Optional[FilterContext] = None) -> ScanResult:
     result = ScanResult()
     session = requests.Session()
+    if filters is None and config.filters_enabled:
+        filters = FilterContext(session=session, now_ms=now_ms, log=log)
 
     try:
         for index, symbol in enumerate(config.symbols):
             if index:
                 time.sleep(config.request_delay_seconds)
             try:
-                _scan_symbol(symbol, config, result, session, now_ms, log)
+                _scan_symbol(symbol, config, result, session, now_ms, log, filters)
             except FetchError as exc:
                 result.failures.append((symbol, str(exc)))
                 log(f"  [WARN] {symbol}: {exc}")
@@ -118,7 +136,7 @@ def scan(config: Config, now_ms: Optional[int] = None, log=print) -> ScanResult:
     return result
 
 
-def _scan_symbol(symbol, config, result, session, now_ms, log) -> None:
+def _scan_symbol(symbol, config, result, session, now_ms, log, filters=None) -> None:
     is_crypto = symbol not in NON_CRYPTO
 
     # --- daily: needed every run, both as a signal and as the 4H filter -----
@@ -144,11 +162,12 @@ def _scan_symbol(symbol, config, result, session, now_ms, log) -> None:
     if _is_fresh(daily_bars[-1][0], "1D", config, result, now_ms):
         direction = detect_reset(daily_series, config.oversold, config.overbought)
         if direction:
-            line += f"   *** 1D {direction.upper()} ***"
-            result.signals.append(
-                _mk(symbol, direction, "1D", daily_series, daily_closes_,
-                    daily_bars, is_crypto)
-            )
+            sig = _mk(symbol, direction, "1D", daily_series, daily_closes_,
+                      daily_bars, is_crypto)
+            keep, note = _apply_filters(sig, filters, result)
+            line += f"   *** 1D {direction.upper()} ({note}) ***"
+            if keep:
+                result.signals.append(sig)
 
     # --- 4H signal, gated on the daily -------------------------------------
     if "4H" in config.timeframes:
@@ -164,17 +183,36 @@ def _scan_symbol(symbol, config, result, session, now_ms, log) -> None:
                     confirmed = direction == daily_bias
                     if confirmed or config.alert_4h_unconfirmed:
                         tag = "1D agrees" if confirmed else f"against 1D {daily_bias}"
-                        line += f"   *** 4H {direction.upper()} ({tag}) ***"
                         sig = _mk(symbol, direction, "4H", h4_series, h4_closes,
                                   h4_bars, is_crypto)
                         sig.daily_rsi = float(daily_rsi) if daily_rsi is not None else None
                         sig.daily_confirmed = confirmed
-                        result.signals.append(sig)
+                        keep, note = _apply_filters(sig, filters, result)
+                        line += f"   *** 4H {direction.upper()} ({tag}; {note}) ***"
+                        if keep:
+                            result.signals.append(sig)
                     else:
                         result.suppressed += 1
                         line += f"   (4H {direction} suppressed: 1D is {daily_bias})"
 
     log(line)
+
+
+def _apply_filters(sig: Signal, filters: Optional[FilterContext],
+                   result: ScanResult) -> Tuple[bool, str]:
+    """(keep the alert?, note for the console log)."""
+    if filters is None:
+        return True, "filters off"
+    verdict = filters.check(sig.symbol, sig.direction, sig.is_crypto)
+    if verdict.funding_source == SOURCE_BITGET:
+        result.funding_fallback = True
+    if verdict.passed is False:
+        result.filtered += 1
+        return False, "FILTERED: " + ", ".join(verdict.blocked_by)
+    if verdict.passed is None:
+        sig.unverified = ", ".join(verdict.unavailable)
+        return True, f"unverified: no {sig.unverified} data"
+    return True, "filters pass"
 
 
 def _mk(symbol, direction, timeframe, series, closes, bars, is_crypto) -> Signal:

@@ -232,3 +232,34 @@ def test_empty_scan_is_dated_by_the_last_closed_bar_not_by_now():
     """
     text = build_digest(res([], last_bar_ts_ms=1_755_734_400_000))
     assert "2025-08-21" in text
+
+
+# --------------------------------------------------------------------------
+# Trade filters in config and digest
+# --------------------------------------------------------------------------
+
+def test_counter_trend_4h_is_off_by_default_and_can_be_turned_on():
+    """The user wants only 4H resets that agree with the daily."""
+    assert Config.from_env({}).alert_4h_unconfirmed is False
+    assert Config.from_env({"ALERT_4H_UNCONFIRMED": "true"}).alert_4h_unconfirmed is True
+
+
+def test_filters_default_on_and_can_be_turned_off():
+    assert Config.from_env({}).filters_enabled is True
+    assert Config.from_env({"RSI_FILTERS": "false"}).filters_enabled is False
+
+
+def test_footer_counts_filtered_resets_without_listing_them():
+    digest = build_digest(res([sig("ETHUSDT", "bullish", 28.0, 31.0)], filtered=3))
+    assert "3 filtered" in digest
+
+
+def test_unverified_signal_is_marked_in_the_digest():
+    s = sig("CROUSDT", "bullish", 28.0, 31.0)
+    s.unverified = "trend, funding"
+    assert "unfiltered: no trend, funding data" in build_digest(res([s]))
+
+
+def test_funding_fallback_is_disclosed():
+    digest = build_digest(res([sig("ETHUSDT", "bullish", 28.0, 31.0)], funding_fallback=True))
+    assert "Bitget" in digest and "90 days" in digest

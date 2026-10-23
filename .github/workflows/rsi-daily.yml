@@ -83,6 +83,11 @@ jobs:
           RSI_DRY_RUN: ${{ inputs.dry_run }}
           DAY_BOUNDARY: utc
           RSI_PERIOD: "7"
-          ALERT_4H_UNCONFIRMED: "true"
+          # 4H resets are only sent when they agree with the daily RSI bias.
+          ALERT_4H_UNCONFIRMED: "false"
+          # Every alert (1D and 4H) must also pass the trade filters: 200-day
+          # EMA trend, BTC 50-day EMA for altcoins, funding crowding. Blocked
+          # resets are hidden; the footer only counts them. "false" disables.
+          RSI_FILTERS: "true"
           POST_WHEN_EMPTY: "false"
         run: python -m rsi_scanner
